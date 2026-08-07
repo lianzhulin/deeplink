@@ -1,0 +1,131 @@
+{
+  "controller": {
+    "name": "ModuleController",
+    "description": "模块控制器接口定义",
+    "version": "1.0.0",
+    "base_address": "0x40000000",
+    "registers": [
+      {
+        "name": "CTRL_REG",
+        "description": "模块控制寄存器（可读写）",
+        "offset": "0x00",
+        "access": "RW",
+        "reset_value": "0x00000000",
+        "width": 32,
+        "fields": [
+          {
+            "name": "MODULE_EN",
+            "description": "模块开关控制位",
+            "bit_offset": 0,
+            "bit_width": 1,
+            "access": "RW",
+            "reset_value": 0,
+            "values": {
+              "0": "模块关闭",
+              "1": "模块开启"
+            }
+          },
+          {
+            "name": "SOFT_RESET",
+            "description": "软件复位控制位",
+            "bit_offset": 1,
+            "bit_width": 1,
+            "access": "RW",
+            "reset_value": 0,
+            "values": {
+              "0": "正常工作",
+              "1": "复位模块（自动清零）"
+            }
+          },
+          {
+            "name": "RESERVED",
+            "description": "保留位",
+            "bit_offset": 2,
+            "bit_width": 30,
+            "access": "RO",
+            "reset_value": 0,
+            "note": "写入忽略，读取为0"
+          }
+        ]
+      },
+      {
+        "name": "STATUS_REG",
+        "description": "模块状态寄存器（只读）",
+        "offset": "0x04",
+        "access": "RO",
+        "reset_value": "0x00000000",
+        "width": 32,
+        "fields": [
+          {
+            "name": "MODULE_STATE",
+            "description": "模块工作状态",
+            "bit_offset": 0,
+            "bit_width": 2,
+            "access": "RO",
+            "reset_value": 0,
+            "values": {
+              "0": "IDLE（空闲）",
+              "1": "RUNNING（运行中）",
+              "2": "BUSY（忙碌）",
+              "3": "ERROR（错误）"
+            }
+          },
+          {
+            "name": "FIFO_EMPTY",
+            "description": "FIFO空标志",
+            "bit_offset": 2,
+            "bit_width": 1,
+            "access": "RO",
+            "reset_value": 1,
+            "values": {
+              "0": "FIFO非空",
+              "1": "FIFO为空"
+            }
+          },
+          {
+            "name": "FIFO_FULL",
+            "description": "FIFO满标志",
+            "bit_offset": 3,
+            "bit_width": 1,
+            "access": "RO",
+            "reset_value": 0,
+            "values": {
+              "0": "FIFO未满",
+              "1": "FIFO为满"
+            }
+          },
+          {
+            "name": "ERR_FLAG",
+            "description": "错误标志位",
+            "bit_offset": 4,
+            "bit_width": 1,
+            "access": "RO",
+            "reset_value": 0,
+            "values": {
+              "0": "无错误",
+              "1": "检测到错误，查看ERR_CODE"
+            }
+          },
+          {
+            "name": "ERR_CODE",
+            "description": "错误代码",
+            "bit_offset": 8,
+            "bit_width": 8,
+            "access": "RO",
+            "reset_value": 0,
+            "note": "仅当ERR_FLAG=1时有效"
+          },
+          {
+            "name": "RESERVED",
+            "description": "保留位",
+            "bit_offset": 16,
+            "bit_width": 16,
+            "access": "RO",
+            "reset_value": 0,
+            "note": "读取为0"
+          }
+        ]
+      }
+    ]
+  }
+}
