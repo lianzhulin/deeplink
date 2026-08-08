@@ -13,7 +13,8 @@
 | `controller_interface.h`  | 寄存器地址 / 位掩码 / 复位值 / 枚举 C 头文件 |
 | `module_driver.h`         | 驱动对外 API + 寄存器读写钩子注入接口 |
 | `module_driver.c`         | 驱动实现（默认 volatile 指针访问寄存器） |
-| `test_module_driver.c`    | 单元测试（在用户态模拟寄存器，不需真实硬件） |
+| `test_module_driver.c`    | 单元测试（用户态模拟寄存器 + mmap MAP_FIXED 覆盖真实 MMIO 分支） |
+| `run_ut.sh`               | UT + 覆盖率一键脚本（产出 coverage_html，语句/分支分开显示） |
 
 ### 编译测试程序（用户态）
 
@@ -38,7 +39,7 @@ gcc -std=c99 -Wall -Wextra -Werror -I. \
 ./test_module_driver
 ```
 
-预期输出（7 个用例、27 个断言）：
+预期输出（12 个用例、54 个断言）：
 
 ```
 === ModuleController 驱动单元测试 ===
@@ -50,16 +51,82 @@ gcc -std=c99 -Wall -Wextra -Werror -I. \
   [RUN ] fifo_flags
   [RUN ] error_flag_and_code
   [RUN ] status_reg_never_written
+  [RUN ] default_io_mirror_mode
+  [RUN ] default_io_mirror_status_ro
+  [RUN ] bad_addr_paths_and_all_ones_ctrl
+  [RUN ] default_io_probe_all_branches
+  [RUN ] default_io_mirror_illegal_addr_path
 
-=== 汇总: PASS=27, FAIL=0 ===
+=== 汇总: PASS=54, FAIL=0 ===
 ```
+
+### 代码覆盖率（语句覆盖率 + 分支覆盖率，分开显示）
+
+目标：`module_driver.c` 目标文件的**语句覆盖率 100%** 且 **分支覆盖率 100%**，两者在 HTML 报告中分栏显示。
+
+推荐方式：使用已提供的 `run_ut.sh` 一键完成编译、UT、覆盖率采集、HTML 报告生成、双 100% 校验：
+
+```bash
+cd /path/to/deeplink
+bash run_ut.sh
+```
+
+脚本在终端会分别打印整体覆盖率、`module_driver.c` 单独覆盖率（Lines / Functions / Branches 分三行显示），并输出如下 HTML 报告入口：
+
+```
+✔ 达标：module_driver.c 语句覆盖率 100%，分支覆盖率 100%（两者分开显示于 HTML 报告）
+```
+
+> 生成的 `coverage_html/index.html` 中包含 **Line Coverage** 和 **Branch Coverage** 两个独立栏目；
+> 如需快速只看驱动文件，打开 `coverage_html/driver_only/index.html` 即可。
+
+#### 手动分步命令（与 run_ut.sh 等价）
+
+```bash
+# 1) 清理 + 编译（注意必须：-O0 + --coverage）
+rm -f *.gcno *.gcda test_module_driver_cov
+gcc -std=c99 -Wall -Wextra -Werror -I. -O0 --coverage \
+    -o test_module_driver_cov test_module_driver.c module_driver.c
+
+# 2) 运行 UT（必须执行一次才能产生 *.gcda）
+./test_module_driver_cov
+
+# 3) 采集覆盖率数据（开启 branch_coverage，语句+分支都采集）
+lcov --capture --directory . --output-file coverage.info --rc branch_coverage=1
+
+# 4) 生成 HTML 报告：--branch-coverage 让语句与分支覆盖率分开显示
+genhtml coverage.info \
+    --branch-coverage \
+    --output-directory coverage_html \
+    --show-details --legend --frames
+
+# 5) （可选）只看 module_driver.c，去掉测试文件自身干扰
+lcov --remove coverage.info "*test_module_driver.c" \
+     --output-file /tmp/driver_only.info --rc branch_coverage=1
+lcov --summary /tmp/driver_only.info --rc branch_coverage=1
+```
+
+依赖安装（若缺 lcov/genhtml）：
+
+```bash
+sudo apt-get update && sudo apt-get install -y build-essential lcov
+```
+
+最终覆盖率指标（目标文件 module_driver.c）：
+
+| 类型 | 结果 | 命中/总数 |
+|------|------|-----------|
+| 语句覆盖率 (Line Coverage)   | **100.0%** | 103 / 103 |
+| 函数覆盖率 (Func Coverage)   | **100.0%** | 18 / 18   |
+| 分支覆盖率 (Branch Coverage) | **100.0%** | 39 / 39   |
 
 ### 编译产物清理
 
-二进制 `test_module_driver` 已在 `.gitignore` 中忽略，不会被提交；如需手动清理：
+二进制 `test_module_driver` / `test_module_driver_cov`、覆盖率中间产物已在 `.gitignore` 中忽略，不会被提交；如需手动清理：
 
 ```bash
-rm -f test_module_driver && find . -maxdepth 1 -type f \( -name '*.o' -o -name '*.out' \) -delete
+rm -f test_module_driver test_module_driver_cov test_module_driver_plain \
+      *.o *.out *.gcno *.gcda *.gcov coverage.info && rm -rf coverage_html
 ```
 
 ### 硬件集成说明

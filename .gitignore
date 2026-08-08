@@ -1,5 +1,7 @@
 # 编译产物
 test_module_driver
+test_module_driver_cov
+test_module_driver_plain
 *.o
 *.obj
 *.a
@@ -7,6 +9,13 @@ test_module_driver
 *.out
 *.elf
 *.bin
+
+# 覆盖率中间产物 & 报告
+*.gcno
+*.gcda
+*.gcov
+coverage.info
+coverage_html/
 
 # IDE / Editor
 .vscode/
@@ -18,3 +27,6 @@ test_module_driver
 # OS
 .DS_Store
 Thumbs.db
+
+# Trae 共享包缓存
+.trae-html-share-packages/
