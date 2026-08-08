@@ -1,0 +1,20 @@
+# 编译产物
+test_module_driver
+*.o
+*.obj
+*.a
+*.so
+*.out
+*.elf
+*.bin
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
