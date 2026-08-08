@@ -1,0 +1,1 @@
+genhtml coverage.info --branch-coverage --output-directory coverage_html --show-details --title 'ModuleController Driver Coverage Report' --legend --frames --quiet

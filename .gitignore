@@ -10,12 +10,10 @@ test_module_driver_plain
 *.elf
 *.bin
 
-# 覆盖率中间产物 & 报告
+# 覆盖率中间产物（二进制/gcov 临时数据仍不入库；最终报告 coverage_html/ + coverage.info 需入库存证）
 *.gcno
 *.gcda
 *.gcov
-coverage.info
-coverage_html/
 
 # IDE / Editor
 .vscode/
