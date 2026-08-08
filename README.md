@@ -62,6 +62,12 @@ gcc -std=c99 -Wall -Wextra -Werror -I. \
 
 ### 代码覆盖率（语句覆盖率 + 分支覆盖率，分开显示）
 
+> **在线覆盖率报告**（GitHub Pages）：[https://lianzhulin.github.io/deeplink/coverage_html/index.html](https://lianzhulin.github.io/deeplink/coverage_html/index.html)
+>
+> - 总览报告（含测试文件 + 驱动）：[https://lianzhulin.github.io/deeplink/coverage_html/index.html](https://lianzhulin.github.io/deeplink/coverage_html/index.html)
+> - 纯 `module_driver.c` 双百报告：[https://lianzhulin.github.io/deeplink/coverage_html/driver_only/index.html](https://lianzhulin.github.io/deeplink/coverage_html/driver_only/index.html)
+> - 源码逐行明细：[https://lianzhulin.github.io/deeplink/coverage_html/driver_only/workspace/module_driver.c.gcov.html](https://lianzhulin.github.io/deeplink/coverage_html/driver_only/workspace/module_driver.c.gcov.html)
+
 目标：`module_driver.c` 目标文件的**语句覆盖率 100%** 且 **分支覆盖率 100%**，两者在 HTML 报告中分栏显示。
 
 推荐方式：使用已提供的 `run_ut.sh` 一键完成编译、UT、覆盖率采集、HTML 报告生成、双 100% 校验：
