@@ -1,0 +1,1 @@
+genhtml /tmp/module_driver_coverage.info --branch-coverage --output-directory coverage_html/driver_only --show-details --title 'module_driver.c Coverage (Lines & Branches Separated)' --legend --frames --quiet
