@@ -85,8 +85,12 @@ extern "C" {
  * ====================================================================
  */
 
-#define BDIFF_VERSION        2
-#define BDIFF_VERSION_V1     1  /* still accepted on patch */
+#define BDIFF_VERSION        2   /* v2 standard opcode set (default emit) */
+#define BDIFF_VERSION_V1     1   /* still accepted on patch: legacy 0x01/0x02 */
+#define BDIFF_VERSION_TIGHT  3   /* accepted on patch: compact "BDT3" tight
+                                    8B-per-spot 4B-word write stream; emit
+                                    only when opts.compact_tight=1 AND
+                                    old_size == new_size. */
 
 /* Error codes (superset of v1). */
 #define BDIFF_OK            0
@@ -95,7 +99,7 @@ extern "C" {
 #define BDIFF_E_FORMAT     -3   /* patch corrupt / unknown opcode /
                                    inner length mismatch / bad xdiff tag */
 #define BDIFF_E_TOO_BIG    -4   /* old/new size exceeds the configured cap */
-#define BDIFF_E_VERSION    -5   /* version byte is not 1 or 2 */
+#define BDIFF_E_VERSION    -5   /* version byte / magic not recognised */
 
 typedef struct {
     size_t block_size;      /* hash/lookup block size; 0 => default 16 */
@@ -111,6 +115,15 @@ typedef struct {
                                1 = spend a little more CPU on the diff side
                                to try ADDX + deflate envelope + pick the
                                smallest encoding for each ADD.             */
+    int    compact_tight;   /* 0 = default (emit v2 when diffing);
+                               1 = emit v3 BDT3 8B/spot tight encoding
+                               whenever possible (strictly requires:
+                               old_size == new_size and the diff can be
+                               expressed as N disjoint 4B overwrites; if
+                               a 4B-aligned scan detects any change larger
+                               than a 4B word or too many words, bdiff_diff
+                               will gracefully fall back to v2 so the
+                               caller always gets a valid patch).  */
 } bdiff_opts;
 
 /* Produce a patch transforming old_data -> new_data.

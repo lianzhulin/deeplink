@@ -75,6 +75,18 @@ static uint32_t hash_block(const uint8_t *p, size_t n) {
 /* -------------------------- output buffer ------------------------- */
 typedef struct { uint8_t *buf; size_t len, cap; } obuf;
 
+/* ------- little-endian uint32 helpers (patch metadata + TIGHT) ----- */
+static void le32_put(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >>  8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+static uint32_t le32_get(const uint8_t *p) {
+    return (uint32_t)p[0]        | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16)| ((uint32_t)p[3] << 24);
+}
+
 static int ob_reserve(obuf *o, size_t extra) {
     if (o->len + extra <= o->cap) return 0;
     size_t ncap = o->cap ? o->cap : 64;
@@ -103,6 +115,108 @@ static int ob_vi(obuf *o, uint64_t v) {
     uint8_t tmp[10];
     size_t n = vi_enc(v, tmp);
     return ob_put(o, tmp, n);
+}
+
+/* ----------- v3 TIGHT 8B/spot diff & patch helpers --------------- */
+
+/* Try to diff old==new_size buffers in compact TIGHT mode.  TIGHT only
+ * represents changes as up to ~32k separate 4B overwrites (realistic upper
+ * bound for 128 KB firmware).  Any change where, after 4B-aligning, two
+ * adjacent 4B words both differ → still OK they are 2 spots; only if a
+ * run longer than 4 consecutive bytes differs we *bail* because the
+ * resulting tight stream would be larger than v2.
+ *
+ * Returns:  1 → produced a tight patch; output pointer and size in *out / *out_len valid.
+ *           0 → caller should fall back to v2 (changes don't fit).
+ *          -1 → OOM or size-cap hard fail (propagate as BDIFF_E_*).
+ * If returning -1, *fail_rc is set to the error code.
+ */
+static int try_tight_diff(const uint8_t *old, size_t sz,
+                          const uint8_t *newd,
+                          const bdiff_opts *opts,
+                          void **out, size_t *out_len, int *fail_rc) {
+    /* Heuristic bail thresholds: if #spots exceeds 1/8 of buffer words
+     * (~= 12.5% of bytes changed), tight encoding no longer beats v2
+     * opcode-records because 8B-per-spot * many spots > raw ADD of the
+     * whole buffer.  Also bail if a diff run is wider than 8 bytes (two
+     * adjacent 4B words is fine). */
+    const size_t MAX_SPOTS = sz / 32; /* e.g. 128KB → 4096 spots (~256 μs) */
+    const size_t MAX_RUN   = 8;
+
+    /* Collect spots on a temp array, then sort & dedupe offsets just in
+     * case a 4B boundary got hit twice by the per-byte scan. */
+    size_t cap_spots = MAX_SPOTS ? MAX_SPOTS : 1;
+    uint32_t *offs = (uint32_t *)malloc(cap_spots * sizeof(uint32_t));
+    uint32_t *vals = (uint32_t *)malloc(cap_spots * sizeof(uint32_t));
+    if (!offs || !vals) { free(offs); free(vals); *fail_rc = BDIFF_E_NOMEM; return -1; }
+    size_t n = 0;
+
+    size_t i = 0;
+    while (i < sz) {
+        /* Skip runs of identical bytes. */
+        if (old[i] == newd[i]) { ++i; continue; }
+        /* Measure differing run length starting at i. */
+        size_t j = i;
+        while (j < sz && old[j] != newd[j]) ++j;
+        size_t run = j - i;
+        if (run > MAX_RUN) { free(offs); free(vals); return 0; } /* bail */
+        /* Expand to 4B-aligned coverage of the range [i, j-1]. */
+        size_t lo = i & ~(size_t)3u;
+        size_t hi = (j - 1) | (size_t)3u;   /* last byte index inclusive */
+        /* Emit one or more 4B spots from lo..hi step 4. */
+        for (size_t k = lo; k <= hi && k < sz; k += 4) {
+            if (n == cap_spots) {
+                /* Too many spots → bail. */
+                free(offs); free(vals);
+                return 0;
+            }
+            /* Actually check the 4B word still differs (after prior
+             * expansion might overlap). */
+            uint32_t ow = le32_get(old + k);
+            uint32_t nw = le32_get(newd + k);
+            if (ow == nw) continue;
+            offs[n] = (uint32_t)k;
+            vals[n] = nw;
+            ++n;
+        }
+        i = j;
+    }
+
+    /* Allocate payload: magic(4) + varint(sz) + 8*N. */
+    size_t szvi = vi_size((uint64_t)sz);
+    size_t total = 4 + szvi + 8 * n;
+    if (opts->max_patch_size && total > opts->max_patch_size) {
+        free(offs); free(vals); *fail_rc = BDIFF_E_TOO_BIG; return -1;
+    }
+    uint8_t *buf = (uint8_t *)malloc(total ? total : 1);
+    if (!buf) { free(offs); free(vals); *fail_rc = BDIFF_E_NOMEM; return -1; }
+
+    /* Write header. */
+    size_t w = 0;
+    buf[w++] = 'B'; buf[w++] = 'D'; buf[w++] = 'T'; buf[w++] = '3';
+    w += vi_enc((uint64_t)sz, buf + w);
+    /* Write spots sorted by offset (nicer for sequential patching; not
+     * required, but also validates all offsets unique). */
+    /* Simple N-squared sort for moderate N (N up to thousands); for
+     * 128 KB and 1000s of spots, O(N²) still fine.  */
+    for (size_t a = 0; a < n; ++a) {
+        for (size_t b = a + 1; b < n; ++b) {
+            if (offs[b] < offs[a]) {
+                uint32_t t;
+                t = offs[a]; offs[a] = offs[b]; offs[b] = t;
+                t = vals[a]; vals[a] = vals[b]; vals[b] = t;
+            }
+        }
+    }
+    for (size_t k = 0; k < n; ++k) {
+        uint8_t sp[8];
+        le32_put(sp + 0, offs[k]);
+        le32_put(sp + 4, vals[k]);
+        memcpy(buf + w, sp, 8); w += 8;
+    }
+    free(offs); free(vals);
+    *out = buf; *out_len = w;
+    return 1;
 }
 
 /* --------------------------- hash index --------------------------- */
@@ -409,6 +523,15 @@ int bdiff_diff(const void *old_data, size_t old_size,
     const uint8_t *old  = (const uint8_t *)old_data;
     const uint8_t *newd = (const uint8_t *)new_data;
     const size_t bs = opts.block_size;
+
+    /* ---- Option A: v3 TIGHT 8B/spot encoding (opt-in) ------------- */
+    if (opts.compact_tight && old && old_size == new_size && old_size > 0) {
+        int fr = 0; int tr = try_tight_diff(old, old_size, newd, &opts, out, out_len, &fr);
+        if (tr == 1) return BDIFF_OK;              /* done */
+        if (tr == -1) { *out = NULL; *out_len = 0; return fr; } /* hard fail */
+        /* tr == 0: fall through to the full v2 path. */
+    }
+
     obuf records = {0, 0, 0};
     entry *e = NULL;
     size_t ne = 0;
@@ -765,6 +888,35 @@ int bdiff_patch_opts(const void *old_data, size_t old_size,
     const uint8_t *p   = (const uint8_t *)patch;
     const uint8_t *end = p + patch_size;
     const uint8_t *old = (const uint8_t *)old_data;
+
+    /* --- v3 BDT3 TIGHT path first (4-byte magic) ------------------- */
+    if ((size_t)(end - p) >= 4 &&
+        p[0] == 'B' && p[1] == 'D' && p[2] == 'T' && p[3] == '3') {
+        /* TIGHT needs a source buffer to copy then overwrite in-place. */
+        if (!old) return BDIFF_E_BADARG;
+        p += 4;
+        uint64_t sz64; size_t k;
+        if (vi_dec(p, end, &sz64, &k)) return BDIFF_E_FORMAT;
+        p += k;
+        if (old_size != (size_t)sz64) return BDIFF_E_FORMAT;   /* tight requires exact old size match */
+        if (opts.max_new_size && sz64 > (uint64_t)opts.max_new_size) return BDIFF_E_TOO_BIG;
+        size_t sz = (size_t)sz64;
+        if (((size_t)(end - p)) % 8u != 0) return BDIFF_E_FORMAT;  /* N must be integer */
+        size_t n = (size_t)(end - p) / 8u;
+        /* Allocate output = copy of old. */
+        uint8_t *outb = (uint8_t *)malloc(sz ? sz : 1);
+        if (!outb) return BDIFF_E_NOMEM;
+        memcpy(outb, old, sz);
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t off = le32_get(p + 8*i);
+            uint32_t w   = le32_get(p + 8*i + 4);
+            if ((size_t)off > sz - 4) { free(outb); return BDIFF_E_FORMAT; }
+            le32_put(outb + (size_t)off, w);
+        }
+        /* Duplicate-write sanity: same offset twice is still deterministic. */
+        *out = outb; *out_len = sz;
+        return BDIFF_OK;
+    }
 
     if ((size_t)(end - p) < 5) return BDIFF_E_FORMAT;
     if (!(p[0] == 'B' && p[1] == 'D' && p[2] == 'I' && p[3] == 'F'))

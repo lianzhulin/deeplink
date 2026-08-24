@@ -1,12 +1,16 @@
-/* Bench N=1..10 patch sizes over 20 random layouts on moderate 128KB,
- * using prefer_small.  Build TWO binaries:
- *   bench_plain:   plain, no zlib.       writes "N,trial,PLAIN_BYTES"
- *   bench_zlib:    -DBDIFF_HAVE_ZLIB=1   writes "N,trial,ZLIB_BYTES"
- * Run separately to avoid link conflicts. */
+/* Bench N=1..12 patch sizes over 20 random layouts on moderate 128KB.
+ * Compile with BENCH_MODE ∈ {PLAIN, PLAIN_TIGHT, ZLIB}:
+ *   -D BENCH_MODE=PLAIN or PLAIN_TIGHT or ZLIB (with -DBDIFF_HAVE_ZLIB=1 if ZLIB).
+ * Writes CSV: "#N,trial,mode,bytes"
+ */
 #include "bdiff.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef BENCH_MODE
+#define BENCH_MODE PLAIN
+#endif
 
 static uint32_t rng_st = 0x12345678u;
 static uint8_t rnd(void) {
@@ -28,8 +32,8 @@ static void fill_moderate(uint8_t *p, size_t n, uint32_t seed) {
 }
 static void mutate_N_4B_1byte_each(uint8_t *d, size_t sz, int n, uint32_t seed) {
     rng_st = seed;
-    size_t taken[2048]; int tn = 0; int i = 0;
-    while (i < n && tn < 2048) {
+    size_t taken[4096]; int tn = 0; int i = 0;
+    while (i < n && tn < 4096) {
         uint32_t a = (uint32_t)rnd()<<24 | (uint32_t)rnd()<<16 |
                      (uint32_t)rnd()<<8  | (uint32_t)rnd();
         size_t off = (size_t)a % (sz - 4);
@@ -47,18 +51,21 @@ static void mutate_N_4B_1byte_each(uint8_t *d, size_t sz, int n, uint32_t seed) 
 static const size_t SZ_128K = 128u * 1024u;
 static const int TRIALS = 20;
 
-#ifdef BENCH_PLAIN
-static const char *MODE = "PLAIN";
-#else
-static const char *MODE = "ZLIB";
-#endif
+#define XSTR(x) #x
+#define STR(x) XSTR(x)
 
 int main(void) {
     uint8_t *old  = (uint8_t *)malloc(SZ_128K);
     uint8_t *newd = (uint8_t *)malloc(SZ_128K);
-    bdiff_opts opts = { 16, SZ_128K, SZ_128K, 0, 1 }; /* prefer_small */
+    bdiff_opts opts = { 16, SZ_128K, SZ_128K, 0, 1,
+#if BENCH_MODE==PLAIN_TIGHT
+        1
+#else
+        0
+#endif
+    };
     printf("#N,trial,mode,bytes\n");
-    for (int N = 1; N <= 10; ++N) {
+    for (int N = 1; N <= 12; ++N) {
         for (int t = 0; t < TRIALS; ++t) {
             fill_moderate(old, SZ_128K, (uint32_t)t * 131u + 7u);
             memcpy(newd, old, SZ_128K);
@@ -66,7 +73,6 @@ int main(void) {
             void *patch = NULL; size_t pl = 0;
             int r = bdiff_diff(old, SZ_128K, newd, SZ_128K, &opts, &patch, &pl);
             if (r != BDIFF_OK) { pl = (size_t)-1; }
-            /* verify roundtrip silently */
             if (pl != (size_t)-1) {
                 void *res = NULL; size_t rl = 0;
                 int pr = bdiff_patch_opts(old, SZ_128K, patch, pl, &opts, &res, &rl);
@@ -77,7 +83,7 @@ int main(void) {
                 free(res);
             }
             free(patch);
-            printf("%d,%d,%s,%zu\n", N, t, MODE, pl);
+            printf("%d,%d,%s,%zu\n", N, t, STR(BENCH_MODE), pl);
         }
     }
     free(old); free(newd);
