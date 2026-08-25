@@ -12,6 +12,10 @@
 #define BENCH_MODE PLAIN
 #endif
 
+#define PLAIN       0
+#define PLAIN_TIGHT 1
+#define ZLIB        2
+
 static uint32_t rng_st = 0x12345678u;
 static uint8_t rnd(void) {
     rng_st = rng_st * 1664525u + 1013904223u;

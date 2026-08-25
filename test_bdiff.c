@@ -415,19 +415,19 @@ int main(void) {
         bdiff_opts opts_v2 = { 16, SZ_128K, SZ_128K, 0, 0, 0 };
         bdiff_opts opts_tk = { 16, SZ_128K, SZ_128K, 0, 0, 1 };
 
-        /* T24 1x4B-1byte spot, tight must emit the 8B/spot stream & roundtrip. */
+        /* T24 1x4B-1byte spot, tight must emit the 6B/spot stream & roundtrip. */
         fill_moderate(old_big, SZ_128K, 71); memcpy(new_big, old_big, SZ_128K);
         mutate_N_4B_1byte_each(new_big, SZ_128K, 1, 3141);
         size_t pT = 0;
         check(rt(old_big, SZ_128K, new_big, SZ_128K, &opts_tk, &pT) == 0,
               "T24 TIGHT 1x4B roundtrip");
-        check(pT == 15, "T24 tight size = 4B magic + 3B varint(128K) + 8B spot = 15B");
+        check(pT == 13, "T24 tight size = 4B magic + 3B varint(128K) + 6B spot = 13B");
         size_t pV = 0;
         check(rt(old_big, SZ_128K, new_big, SZ_128K, &opts_v2, &pV) == 0,
               "T24 v2 baseline roundtrip");
         printf("  T24  1 spot  tight=%zuB  v2=%zuB\n", pT, pV);
 
-        /* T25 N=1..10 worst-case sizes: exact upper bound 7 + 8*N. */
+        /* T25 N=1..10 worst-case sizes: exact upper bound 7 + 6*N. */
         int worst[13] = {0};
         int max_worst_ok = 1;
         for (int N = 1; N <= 10; ++N) {
@@ -441,43 +441,43 @@ int main(void) {
                       "T25 TIGHT scan roundtrip");
                 if ((int)pl > worst[N]) worst[N] = (int)pl;
             }
-            int bound = 7 + 8*N;
+            int bound = 7 + 6*N;
             if (worst[N] != bound) max_worst_ok = 0;
         }
-        check(max_worst_ok, "T25 N=1..10 worst tight sizes exactly equal 7+8N");
+        check(max_worst_ok, "T25 N=1..10 worst tight sizes exactly equal 7+6N");
         printf("  T25  N=1..10 worst tight = ");
         for (int N=1;N<=10;++N) printf("%d%c", worst[N], N==10?'\n':',');
 
-        /* T26 96B budget with compact_tight = 1 → now support N=11. */
+        /* T26 96B budget with compact_tight = 1 → now support N=14. */
         fill_moderate(old_big, SZ_128K, 127); memcpy(new_big, old_big, SZ_128K);
-        mutate_N_4B_1byte_each(new_big, SZ_128K, 11, 2025);
-        size_t pl11 = 0;
-        check(rt(old_big, SZ_128K, new_big, SZ_128K, &opts_tk, &pl11) == 0,
-              "T26a 11 spots roundtrip tight");
-        check(pl11 == 95, "T26a 11 spots = 4+3+88 = 95 B exactly");
-        check(pl11 <= 96, "T26a 11 spots fits 96B budget");
+        mutate_N_4B_1byte_each(new_big, SZ_128K, 14, 2025);
+        size_t pl14 = 0;
+        check(rt(old_big, SZ_128K, new_big, SZ_128K, &opts_tk, &pl14) == 0,
+              "T26a 14 spots roundtrip tight");
+        check(pl14 == 91, "T26a 14 spots = 4+3+84 = 91 B exactly");
+        check(pl14 <= 96, "T26a 14 spots fits 96B budget");
         fill_moderate(old_big, SZ_128K, 251); memcpy(new_big, old_big, SZ_128K);
-        mutate_N_4B_1byte_each(new_big, SZ_128K, 12, 777);
-        size_t pl12 = 0;
-        check(rt(old_big, SZ_128K, new_big, SZ_128K, &opts_tk, &pl12) == 0,
-              "T26b 12 spots roundtrip tight");
-        check(pl12 == 103, "T26b 12 spots = 103 B exactly");
-        check(pl12 > 96, "T26b 12 spots OVERFLOWS 96B budget");
-        printf("  T26  11 spots = %zuB (in budget)   12 spots = %zuB (overflow)\n",
-               pl11, pl12);
+        mutate_N_4B_1byte_each(new_big, SZ_128K, 15, 777);
+        size_t pl15 = 0;
+        check(rt(old_big, SZ_128K, new_big, SZ_128K, &opts_tk, &pl15) == 0,
+              "T26b 15 spots roundtrip tight");
+        check(pl15 == 97, "T26b 15 spots = 97 B exactly");
+        check(pl15 > 96, "T26b 15 spots OVERFLOWS 96B budget");
+        printf("  T26  14 spots = %zuB (in budget)   15 spots = %zuB (overflow)\n",
+               pl14, pl15);
 
         /* T27 patch size header max enforced on TIGHT payloads too. */
         {
-            bdiff_opts cap = opts_tk; cap.max_patch_size = 95;   /* exactly N=11 */
+            bdiff_opts cap = opts_tk; cap.max_patch_size = 91;   /* exactly N=14 */
             fill_moderate(old_big, SZ_128K, 5); memcpy(new_big, old_big, SZ_128K);
-            mutate_N_4B_1byte_each(new_big, SZ_128K, 11, 99);
+            mutate_N_4B_1byte_each(new_big, SZ_128K, 14, 99);
             void *p = NULL; size_t pl = 0;
             int r = bdiff_diff(old_big, SZ_128K, new_big, SZ_128K, &cap, &p, &pl);
-            check(r == 0, "T27a N=11 fits cap=95");
+            check(r == 0, "T27a N=14 fits cap=91");
             free(p);
-            cap.max_patch_size = 94;
+            cap.max_patch_size = 90;
             r = bdiff_diff(old_big, SZ_128K, new_big, SZ_128K, &cap, &p, &pl);
-            check(r == BDIFF_E_TOO_BIG, "T27b N=11 rejected under cap=94");
+            check(r == BDIFF_E_TOO_BIG, "T27b N=14 rejected under cap=90");
             free(p);
             printf("  PASS  T27 max_patch_size enforced for TIGHT\n");
         }
@@ -503,18 +503,16 @@ int main(void) {
             check(r == BDIFF_E_FORMAT, "T28b BDT3 non-aligned len rejected");
             free(res); free(fake_p);
 
-            /* 3) spot offset beyond sz-4 → format. */
-            uint8_t *evil = (uint8_t *)malloc(4 + 3 + 8);
+            /* 3) spot word_offset beyond sz/4-1 → format. */
+            uint8_t *evil = (uint8_t *)malloc(4 + 3 + 6);
             size_t ei = 0;
             evil[ei++]='B'; evil[ei++]='D'; evil[ei++]='T'; evil[ei++]='3';
             /* varint 128K = 0x80,0x80,0x08 */
             evil[ei++]=0x80; evil[ei++]=0x80; evil[ei++]=0x08;
-            /* offset_le: SZ_128K-3 (overflows sz-4) */
-            uint32_t bad = (uint32_t)(SZ_128K - 3);
-            evil[ei++] = (uint8_t)(bad & 0xFF);
-            evil[ei++] = (uint8_t)((bad >> 8) & 0xFF);
-            evil[ei++] = (uint8_t)((bad >> 16) & 0xFF);
-            evil[ei++] = (uint8_t)((bad >> 24) & 0xFF);
+            /* word_offset: SZ_128K/4 = 32768 → byte off = 131072 = sz → overflows sz-4 */
+            uint16_t bad_woff = (uint16_t)(SZ_128K / 4);
+            evil[ei++] = (uint8_t)(bad_woff & 0xFFu);
+            evil[ei++] = (uint8_t)((bad_woff >> 8) & 0xFFu);
             for (int k=0;k<4;++k) evil[ei++] = 0xAAu;
             r = bdiff_patch_opts(old_big, SZ_128K, evil, ei, &opts_tk, &res, &rl);
             check(r == BDIFF_E_FORMAT, "T28c BDT3 bad spot offset rejected");
@@ -566,7 +564,7 @@ int main(void) {
         bdiff_opts opts_tk = { 16, SZ_128K, SZ_128K * 2, 0, 0, 1 }; /* allow new bigger */
 
         /* T31 1024 bytes contiguous overwrite inside 128K.
-         * TIGHT spots-only would require ceil(1024/4)=256 spots *8 +7 = 2055B,
+         * TIGHT spots-only would require ceil(1024/4)=256 spots *6 +7 = 1543B,
          * but a single ADD_BIG should be < 1050B, and magic MUST be BDIF (fallback). */
         fill_moderate(old_big, SZ_128K, 0xC0FFEEu); memcpy(new_big, old_big, SZ_128K);
         for (size_t i = 0; i < 1024; ++i) new_big[0x1E000u + i] ^= (uint8_t)(0xA5u + (i & 0x3Fu));
@@ -579,7 +577,7 @@ int main(void) {
         /* expected upper bound: 6B header + 3B vi(new_size) + 1B COPY_SMALL/COPY vi off(3)
          * + 1B vi len(~2) + ADD_BIG op 1B + vi len 2B + vi old_off 3B + 1024B payload + tail copy
          * → definitely way under 2000B (which is tight spots-only). */
-        check(pl < 2000, "T31 v2 patch < 2000B (tight spots-only = 2055B)");
+        check(pl < 2000, "T31 v2 patch < 2000B (tight spots-only = 1543B)");
         {   /* roundtrip check */
             void *res = NULL; size_t rl = 0;
             int r = bdiff_patch_opts(old_big, SZ_128K, p, pl, &opts_tk, &res, &rl);

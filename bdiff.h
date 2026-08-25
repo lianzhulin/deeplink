@@ -88,9 +88,11 @@ extern "C" {
 #define BDIFF_VERSION        2   /* v2 standard opcode set (default emit) */
 #define BDIFF_VERSION_V1     1   /* still accepted on patch: legacy 0x01/0x02 */
 #define BDIFF_VERSION_TIGHT  3   /* accepted on patch: compact "BDT3" tight
-                                    8B-per-spot 4B-word write stream; emit
+                                    6B-per-spot 4B-word write stream
+                                    (2B word_offset + 4B value); emit
                                     only when opts.compact_tight=1 AND
-                                    old_size == new_size. */
+                                    old_size == new_size AND
+                                    old_size <= 256KB (65536 words). */
 
 /* Error codes (superset of v1). */
 #define BDIFF_OK            0
@@ -116,14 +118,16 @@ typedef struct {
                                to try ADDX + deflate envelope + pick the
                                smallest encoding for each ADD.             */
     int    compact_tight;   /* 0 = default (emit v2 when diffing);
-                               1 = emit v3 BDT3 8B/spot tight encoding
-                               whenever possible (strictly requires:
-                               old_size == new_size and the diff can be
-                               expressed as N disjoint 4B overwrites; if
-                               a 4B-aligned scan detects any change larger
-                               than a 4B word or too many words, bdiff_diff
-                               will gracefully fall back to v2 so the
-                               caller always gets a valid patch).  */
+                               1 = emit v3 BDT3 6B/spot tight encoding
+                               (2B word_offset + 4B value) whenever
+                               possible (strictly requires:
+                               old_size == new_size, old_size <= 256KB,
+                               and the diff can be expressed as N disjoint
+                               4B overwrites; if a 4B-aligned scan detects
+                               any change larger than a 4B word or too many
+                               words, bdiff_diff will gracefully fall back
+                               to v2 so the caller always gets a valid
+                               patch).  */
 } bdiff_opts;
 
 /* Produce a patch transforming old_data -> new_data.
