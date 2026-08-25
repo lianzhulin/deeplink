@@ -1,9 +1,9 @@
 # bdiff v2/v3 — 固件补丁算法 · 代码与测评报告
 
-生成时间：2026-08-25（v3 TIGHT 6B/spot 优化）
+生成时间：2026-08-25（W-opcode + BDT4 优化）
 构建基线：`gcc -O2 -Wall -Wextra -std=c99 -Werror`
 zlib 构建：`-DBDIFF_HAVE_ZLIB=1 -lz`
-ASan/UBSan：两者均 0 告警（122/122 通过）
+ASan/UBSan：两者均 0 告警（135/135 通过）
 
 ---
 
@@ -30,7 +30,7 @@ ASan/UBSan：两者均 0 告警（122/122 通过）
 |---|---|
 | bdiff.h | 公共 API、错误码、bdiff_opts、v2 格式/Opcode 规范、v3 `BDIFF_VERSION_TIGHT` + `compact_tight` 标志 |
 | bdiff.c | 算法实现：v3 TIGHT 扫描+编码器、TIGHT 解码器；v2 哈希索引、贪心最长匹配、立即值 opcode emit、ADDX zero-run 微码、raw-deflate 信封、v1/v2 双解码器 |
-| test_bdiff.c | 自测（122 项）：baseline T1–T23 + v3 TIGHT T24–T30（含 7+6N 精确性、96B 预算、fallback、解码器格式防护） + T31/T32 opcode 优势场景 |
+| test_bdiff.c | 自测（135 项）：baseline T1–T23 + v3 TIGHT T24–T32 + W-opcode T33 + BDT4 T34–T36（含 7+6N 精确性、96B 预算、fallback、解码器格式防护、W 变体 roundtrip、BDT4 多字 spot + guard） |
 | bench_patch_sizes.c | N=1..12 × 20 trial ×（PLAIN / PLAIN_TIGHT / ZLIB）patch size 基准 |
 | Makefile | `make test`（plain）/ `make test_z`（zlib）；`ASAN=1` 开地址/UB 消毒 |
 | plain.csv / tight.csv / zlib.csv | 基准原始输出（240 行 / 档） |
@@ -137,7 +137,7 @@ v3 TIGHT 的代价：**不管字内改几个字节都按整字 4B 写回**，因
 - **deflate 信封的启用门限**：N≤10 时记录流本身 <90B，`records.len > 50 && 压缩后 + 信封头 < 原大小 - 2B` 的严格启用条件不满足 → plain 与 zlib 一致。这是**正确决策**，避免 deflate 头把小包反而变大。生效的典型场景：T15（8×128B 扇区覆盖）1109B → 196B（−82%）；T23（64×4B 散布改）558B → 506B（−9%）。
 - **fallback 正确场景（T29 测试）**：N=1、20 字节连续全改（超过 TIGHT 的 `MAX_RUN=8`）→ 自动回退 v2，最终 patch 仅 45 B，BDIF 魔数验证。
 
-### 5.2 防御性 / 稳健性自测（122/122 全通过）
+### 5.2 防御性 / 稳健性自测（135/135 全通过）
 
 - T1–T11：baseline（identical / 1-byte / empty-old / empty-new / 散布 40 字节 / bad-magic & bad-version 拒绝 / too-small old 安全失败 / 平移插入 / 两区域 / 64 字节块 / 非对齐字节）。
 - T12–T16：128KB 真实固件 identical / 1×4B / 4×4B / 8×128B 扇区覆盖 / 64K 边界 4B 平移。
@@ -156,7 +156,7 @@ v3 TIGHT 的代价：**不管字内改几个字节都按整字 4B 写回**，因
 ## 6. 构建与自检命令
 
 ```sh
-# 代码自测（无 deflate）—— 应输出 122 passed, 0 failed
+# 代码自测（无 deflate）—— 应输出 135 passed, 0 failed
 make test
 
 # 启用 zlib deflate 信封

@@ -66,8 +66,20 @@ extern "C" {
  *                                     then 1 byte = low 8 bits of offset
  *                                     -> total offset 10 bits (0..1023),
  *                                        len 1..8, full record 2 bytes only
+ *  Word-offset family (W-variants, emitted when old_size ≤ 256KB) ------
+ *   Same semantics as their varint counterparts, but offset is encoded
+ *   as u16le(word_offset) = byte_offset/4, saving 1 byte per record
+ *   on 128KB blocks (2B vs 3B varint).
+ *   0x80             COPY_W_BIG : u16le(woff), varint(len)
+ *   0x81..0x9F       COPY_W_SMALL_LEN: len = (opcode&0x1F)+1 (1..31),
+ *                                     then u16le(woff) — total 3 bytes
+ *   0xA0             ADDX_W_BIG: varint(len), u16le(woff),
+ *                               varint(xdiff_enc_len), xdiff bytes
+ *   0xA1..0xBF       ADDX_W_SMALL: len = (opcode&0x1F) (1..31),
+ *                               then u16le(woff),
+ *                               varint(xdiff_enc_len), encoded bytes
  *  Reserved ---------
- *   0x80..0xFE       reserved (fail-safe: unknown opcode => E_FORMAT)
+ *   0xC0..0xFE       reserved (fail-safe: unknown opcode => E_FORMAT)
  *   0xFF             reserved escape for future extensions
  *
  * xdiff encoding (used inside ADDX):
@@ -93,6 +105,9 @@ extern "C" {
                                     only when opts.compact_tight=1 AND
                                     old_size == new_size AND
                                     old_size <= 256KB (65536 words). */
+/* "BDT4" tight run-encoded: groups of consecutive 4B words.
+   Group = u16le(start_woff) + u8(count) + count×u32le(val).
+   Emitter picks BDT3 vs BDT4 whichever is smaller. */
 
 /* Error codes (superset of v1). */
 #define BDIFF_OK            0

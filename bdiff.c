@@ -196,23 +196,8 @@ static int try_tight_diff(const uint8_t *old, size_t sz,
         i = j;
     }
 
-    /* Allocate payload: magic(4) + varint(sz) + 6*N. */
-    size_t szvi = vi_size((uint64_t)sz);
-    size_t total = 4 + szvi + 6 * n;
-    if (opts->max_patch_size && total > opts->max_patch_size) {
-        free(offs); free(vals); *fail_rc = BDIFF_E_TOO_BIG; return -1;
-    }
-    uint8_t *buf = (uint8_t *)malloc(total ? total : 1);
-    if (!buf) { free(offs); free(vals); *fail_rc = BDIFF_E_NOMEM; return -1; }
-
-    /* Write header. */
-    size_t w = 0;
-    buf[w++] = 'B'; buf[w++] = 'D'; buf[w++] = 'T'; buf[w++] = '3';
-    w += vi_enc((uint64_t)sz, buf + w);
-    /* Write spots sorted by offset (nicer for sequential patching; not
-     * required, but also validates all offsets unique). */
-    /* Simple N-squared sort for moderate N (N up to thousands); for
-     * 128 KB and 1000s of spots, O(N²) still fine.  */
+    /* Sort spots by offset (required for BDT4 grouping; also nicer for
+     * sequential patching). Simple N-squared sort for moderate N. */
     for (size_t a = 0; a < n; ++a) {
         for (size_t b = a + 1; b < n; ++b) {
             if (offs[b] < offs[a]) {
@@ -222,11 +207,76 @@ static int try_tight_diff(const uint8_t *old, size_t sz,
             }
         }
     }
-    for (size_t k = 0; k < n; ++k) {
-        uint8_t sp[6];
-        le16_put(sp + 0, (uint16_t)(offs[k] / 4u));
-        le32_put(sp + 2, vals[k]);
-        memcpy(buf + w, sp, 6); w += 6;
+
+    /* Compute BDT3 size: magic(4) + varint(sz) + 6*N */
+    size_t szvi = vi_size((uint64_t)sz);
+    size_t total3 = 4 + szvi + 6 * n;
+
+    /* Compute BDT4 size: group consecutive woff spots.
+     * Each group: u16le(start_woff) + u8(count) + count×u32le(val)
+     * = 3 + 4×count bytes. */
+    size_t num_groups = 0;
+    size_t total4_body = 0;
+    if (n > 0) {
+        size_t gi = 0;
+        while (gi < n) {
+            size_t gc = 1;
+            while (gi + gc < n &&
+                   offs[gi + gc] == offs[gi + gc - 1] + 4) {
+                gc++;
+            }
+            num_groups++;
+            total4_body += 3 + 4 * gc;
+            gi += gc;
+        }
+    }
+    size_t total4 = 4 + szvi + total4_body;
+
+    /* Pick the smaller format. */
+    int use_bdt4 = (total4 < total3);
+    size_t total = use_bdt4 ? total4 : total3;
+
+    if (opts->max_patch_size && total > opts->max_patch_size) {
+        free(offs); free(vals); *fail_rc = BDIFF_E_TOO_BIG; return -1;
+    }
+    uint8_t *buf = (uint8_t *)malloc(total ? total : 1);
+    if (!buf) { free(offs); free(vals); *fail_rc = BDIFF_E_NOMEM; return -1; }
+
+    /* Write header. */
+    size_t w = 0;
+    if (use_bdt4) {
+        buf[w++] = 'B'; buf[w++] = 'D'; buf[w++] = 'T'; buf[w++] = '4';
+    } else {
+        buf[w++] = 'B'; buf[w++] = 'D'; buf[w++] = 'T'; buf[w++] = '3';
+    }
+    w += vi_enc((uint64_t)sz, buf + w);
+
+    if (use_bdt4) {
+        /* Write grouped spots. */
+        size_t gi = 0;
+        while (gi < n) {
+            size_t gc = 1;
+            while (gi + gc < n &&
+                   offs[gi + gc] == offs[gi + gc - 1] + 4) {
+                gc++;
+            }
+            uint8_t grp[3];
+            le16_put(grp + 0, (uint16_t)(offs[gi] / 4u));
+            grp[2] = (uint8_t)gc;
+            memcpy(buf + w, grp, 3); w += 3;
+            for (size_t c = 0; c < gc; ++c) {
+                le32_put(buf + w, vals[gi + c]); w += 4;
+            }
+            gi += gc;
+        }
+    } else {
+        /* Write BDT3 simple spots. */
+        for (size_t k = 0; k < n; ++k) {
+            uint8_t sp[6];
+            le16_put(sp + 0, (uint16_t)(offs[k] / 4u));
+            le32_put(sp + 2, vals[k]);
+            memcpy(buf + w, sp, 6); w += 6;
+        }
     }
     free(offs); free(vals);
     *out = buf; *out_len = w;
@@ -459,17 +509,25 @@ static int emit_add_by_offset(obuf *o,
             free(xdiff_enc); xdiff_enc = NULL;
             goto no_b;
         }
-        /* Build header shape: ADDX_SMALL if len 1..31 else ADDX_BIG. */
-        hdr_b = (uint8_t *)malloc(1 + 10 + 10 + 1);
+        /* Build header shape: use W-variant (u16 word_offset) when
+         * old_size ≤ 256KB and offset is 4B-aligned; saves 1B. */
+        int use_w = (old_size / 4 <= 65535u &&
+                     (corresponding_old_offset & 3u) == 0);
+        hdr_b = (uint8_t *)malloc(1 + 10 + 10 + 2);
         if (!hdr_b) goto no_b;
         size_t w = 0;
         if (new_len >= 1 && new_len <= 31) {
-            hdr_b[w++] = (uint8_t)(0x20 | (uint8_t)new_len); /* ADDX_SMALL */
+            hdr_b[w++] = (uint8_t)(use_w ? 0xA0 : 0x20) | (uint8_t)new_len;
         } else {
-            hdr_b[w++] = 0x20;                              /* ADDX_BIG   */
+            hdr_b[w++] = use_w ? 0xA0 : 0x20;
             w += vi_enc((uint64_t)new_len, hdr_b + w);
         }
-        w += vi_enc((uint64_t)corresponding_old_offset, hdr_b + w);
+        if (use_w) {
+            le16_put(hdr_b + w, (uint16_t)(corresponding_old_offset / 4u));
+            w += 2;
+        } else {
+            w += vi_enc((uint64_t)corresponding_old_offset, hdr_b + w);
+        }
         w += vi_enc((uint64_t)xdiff_enc_len, hdr_b + w);
         hdr_b_len = w;
         size_b = hdr_b_len + xdiff_enc_len;
@@ -497,21 +555,39 @@ oom:
 }
 
 /* Emit a COPY record in the smallest v2 shape that fits.
+ * When old_size ≤ 256KB, W-variants (u16 word_offset) are used instead
+ * of varint byte-offset, saving 1B per record.
  * Returns 0 on success, -1 on OOM. */
-static int emit_copy(obuf *o, size_t off, size_t len) {
-    /* COPY_SMALL_BOTH: off∈[0,1023], len∈[1,8] => 2 bytes total. */
+static int emit_copy(obuf *o, size_t off, size_t len, size_t old_size) {
+    int use_w = (old_size / 4 <= 65535u);  /* u16 woff fits */
+    /* COPY_SMALL_BOTH: off∈[0,1023], len∈[1,8] => 2 bytes total.
+     * W-variant can't beat this (3B), so keep it for small offsets. */
     if (len >= 1 && len <= 8 && off <= 1023) {
         uint8_t b[2];
         b[0] = (uint8_t)(0x60 | (((off >> 8) & 3) << 3) | ((len - 1) & 7));
         b[1] = (uint8_t)(off & 0xFFu);
         return ob_put(o, b, 2);
     }
-    /* COPY_SMALL_LEN: len∈[1,31], any off => 1 + vi_size((uint64_t)off) bytes. */
+    /* COPY_SMALL_LEN / COPY_W_SMALL_LEN: len∈[1,31] */
     if (len >= 1 && len <= 31) {
+        if (use_w && (off & 3u) == 0) {
+            /* COPY_W_SMALL_LEN: 1B op + 2B woff = 3B */
+            uint8_t b[3];
+            b[0] = (uint8_t)(0x80 | (uint8_t)len);
+            le16_put(b + 1, (uint16_t)(off / 4u));
+            return ob_put(o, b, 3);
+        }
         if (ob_u8(o, (uint8_t)(0x40 | (uint8_t)len))) return -1;
         return ob_vi(o, (uint64_t)off);
     }
-    /* COPY_BIG. */
+    /* COPY_BIG / COPY_W_BIG */
+    if (use_w && (off & 3u) == 0) {
+        if (ob_u8(o, 0x80)) return -1;
+        uint8_t b[2];
+        le16_put(b, (uint16_t)(off / 4u));
+        if (ob_put(o, b, 2)) return -1;
+        return ob_vi(o, (uint64_t)len);
+    }
     if (ob_u8(o, 0x40)) return -1;
     if (ob_vi(o, (uint64_t)off)) return -1;
     return ob_vi(o, (uint64_t)len);
@@ -598,7 +674,7 @@ int bdiff_diff(const void *old_data, size_t old_size,
                     rc = BDIFF_E_NOMEM; goto done;
                 }
             }
-            if (emit_copy(&records, off - b, m + b)) {
+            if (emit_copy(&records, off - b, m + b, old_size)) {
                 rc = BDIFF_E_NOMEM; goto done;
             }
             np += m;
@@ -708,18 +784,26 @@ static int decode_addx(uint8_t op,
                        const uint8_t **pp, const uint8_t *end,
                        const uint8_t *old, size_t old_size,
                        obuf *out, uint64_t *produced, uint64_t nsize) {
+    int is_w = (op >= 0xA0 && op <= 0xBF);  /* ADDX_W_BIG / ADDX_W_SMALL */
     uint64_t len;
-    if (op == 0x20) {   /* ADDX_BIG */
+    if ((op == 0x20) || (op == 0xA0)) {   /* ADDX_BIG / ADDX_W_BIG */
         uint64_t v; size_t k;
         if (vi_dec(*pp, end, &v, &k)) return -1;
         *pp += k; len = v;
-    } else {            /* ADDX_SMALL: len = op & 0x1F */
+    } else {            /* ADDX_SMALL / ADDX_W_SMALL: len = op & 0x1F */
         len = (uint64_t)(op & 0x1Fu);
         if (len == 0) return -1;
     }
     uint64_t off, enclen; size_t k;
-    if (vi_dec(*pp, end, &off, &k))    return -1;
-    *pp += k;
+    if (is_w) {
+        /* u16le word_offset */
+        if ((size_t)(end - *pp) < 2) return -1;
+        off = (uint64_t)le16_get(*pp) * 4u;
+        *pp += 2;
+    } else {
+        if (vi_dec(*pp, end, &off, &k))    return -1;
+        *pp += k;
+    }
     if (vi_dec(*pp, end, &enclen, &k)) return -1;
     *pp += k;
     if (len > nsize - *produced) return -1;
@@ -810,6 +894,50 @@ static int decode_records(const uint8_t *rec, const uint8_t *rec_end,
             if (off > (uint64_t)old_size - (size_t)len) return -1;
             if (ob_put(out, old + (size_t)off, (size_t)len)) return -2;
             produced += len;
+            continue;
+        }
+        /* W-variant COPY and ADDX opcodes (0x80..0xBF) */
+        if (op >= 0x81 && op <= 0x9F) {
+            /* COPY_W_SMALL_LEN: len = (op&0x1F); then u16le woff */
+            uint64_t len = (uint64_t)(op & 0x1Fu);
+            if (len == 0) return -1;
+            if ((size_t)(rec_end - p) < 2) return -1;
+            uint64_t off = (uint64_t)le16_get(p) * 4u;
+            p += 2;
+            if (len > nsize - produced) return -1;
+            if (len > (uint64_t)old_size) return -1;
+            if (off > (uint64_t)old_size - (size_t)len) return -1;
+            if (ob_put(out, old + (size_t)off, (size_t)len)) return -2;
+            produced += len;
+            continue;
+        }
+        if (op == 0x80) {
+            /* COPY_W_BIG: u16le woff + varint len */
+            if ((size_t)(rec_end - p) < 2) return -1;
+            uint64_t off = (uint64_t)le16_get(p) * 4u;
+            p += 2;
+            uint64_t len; size_t k;
+            if (vi_dec(p, rec_end, &len, &k)) return -1;
+            p += k;
+            if (len > nsize - produced) return -1;
+            if (len > (uint64_t)old_size) return -1;
+            if (off > (uint64_t)old_size - (size_t)len) return -1;
+            if (ob_put(out, old + (size_t)off, (size_t)len)) return -2;
+            produced += len;
+            continue;
+        }
+        if (op >= 0xA1 && op <= 0xBF) {
+            /* ADDX_W_SMALL */
+            int r = decode_addx(op, &p, rec_end, old, old_size, out, &produced, nsize);
+            if (r == -1) return -1;
+            if (r == -2) return -2;
+            continue;
+        }
+        if (op == 0xA0) {
+            /* ADDX_W_BIG */
+            int r = decode_addx(0xA0, &p, rec_end, old, old_size, out, &produced, nsize);
+            if (r == -1) return -1;
+            if (r == -2) return -2;
             continue;
         }
         if (op >= 0x41 && op <= 0x5F) {
@@ -929,6 +1057,38 @@ int bdiff_patch_opts(const void *old_data, size_t old_size,
             le32_put(outb + (size_t)off, w);
         }
         /* Duplicate-write sanity: same offset twice is still deterministic. */
+        *out = outb; *out_len = sz;
+        return BDIFF_OK;
+    }
+
+    /* --- v3 BDT4 TIGHT run-encoded path ---------------------------- */
+    if ((size_t)(end - p) >= 4 &&
+        p[0] == 'B' && p[1] == 'D' && p[2] == 'T' && p[3] == '4') {
+        if (!old) return BDIFF_E_BADARG;
+        p += 4;
+        uint64_t sz64; size_t k;
+        if (vi_dec(p, end, &sz64, &k)) return BDIFF_E_FORMAT;
+        p += k;
+        if (old_size != (size_t)sz64) return BDIFF_E_FORMAT;
+        if (opts.max_new_size && sz64 > (uint64_t)opts.max_new_size) return BDIFF_E_TOO_BIG;
+        size_t sz = (size_t)sz64;
+        uint8_t *outb = (uint8_t *)malloc(sz ? sz : 1);
+        if (!outb) return BDIFF_E_NOMEM;
+        memcpy(outb, old, sz);
+        /* Decode groups: u16le(start_woff) + u8(count) + count×u32le(val) */
+        while (p < end) {
+            if ((size_t)(end - p) < 3) { free(outb); return BDIFF_E_FORMAT; }
+            uint16_t woff = le16_get(p); p += 2;
+            uint8_t gc = *p++;
+            uint32_t off = (uint32_t)woff * 4u;
+            if ((size_t)(end - p) < (size_t)gc * 4u) { free(outb); return BDIFF_E_FORMAT; }
+            for (uint8_t c = 0; c < gc; ++c) {
+                uint32_t w = le32_get(p); p += 4;
+                uint32_t bo = off + (uint32_t)c * 4u;
+                if ((size_t)bo > sz - 4 || (size_t)bo + 4 > sz) { free(outb); return BDIFF_E_FORMAT; }
+                le32_put(outb + (size_t)bo, w);
+            }
+        }
         *out = outb; *out_len = sz;
         return BDIFF_OK;
     }

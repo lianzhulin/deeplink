@@ -617,6 +617,100 @@ int main(void) {
         free(nsmall);
     }
 
+    /* ---- T33: W-variant opcode roundtrip (128KB block) ---- */
+    {
+        fill_moderate(old_big, SZ_128K, 200); memcpy(new_big, old_big, SZ_128K);
+        /* Modify 3 spots at 4B-aligned offsets to trigger ADDX_W_SMALL */
+        for (int i = 0; i < 4; ++i) new_big[0x1000 + i] ^= 0xFF;
+        for (int i = 0; i < 4; ++i) new_big[0x2000 + i] ^= 0xAA;
+        for (int i = 0; i < 4; ++i) new_big[0x3000 + i] ^= 0x55;
+        bdiff_opts opts_w = {16, SZ_128K, SZ_128K, 0, 1, 0};
+        void *p = NULL; size_t pl = 0;
+        check(bdiff_diff(old_big, SZ_128K, new_big, SZ_128K, &opts_w, &p, &pl) == 0,
+              "T33 W-variant diff ok");
+        check(pl < 60, "T33 W-variant patch small (<60B)");
+        /* Verify BDIF header (v2 path, not TIGHT) */
+        const uint8_t *pb = (const uint8_t *)p;
+        check(pb[0]=='B' && pb[1]=='D' && pb[2]=='I' && pb[3]=='F',
+              "T33 uses BDIF header");
+        void *res = NULL; size_t rl = 0;
+        int r = bdiff_patch_opts(old_big, SZ_128K, p, pl, &opts_w, &res, &rl);
+        check(r == 0 && rl == SZ_128K && memcmp(res, new_big, SZ_128K) == 0,
+              "T33 W-variant roundtrip ok");
+        free(res);
+        printf("  T33  3×4B spots (W-variant)  patch = %zuB (BDIF v2)\n", pl);
+        free(p);
+    }
+
+    /* ---- T34: BDT4 multi-word spot encoding ---- */
+    {
+        /* Create 2 consecutive 4B words (8B run, within MAX_RUN) + 2 more
+         * nearby to trigger BDT4 grouping. Each pair of adjacent words
+         * forms a BDT4 group. */
+        fill_moderate(old_big, SZ_128K, 201); memcpy(new_big, old_big, SZ_128K);
+        /* 2 adjacent 4B words at 0x1000 (8B run, within MAX_RUN=8) */
+        for (int i = 0; i < 4; ++i) new_big[0x1000 + i] ^= 0xFF;
+        for (int i = 0; i < 4; ++i) new_big[0x1004 + i] ^= 0xAA;
+        bdiff_opts opts_t4 = {16, SZ_128K, SZ_128K, 0, 0, 1};
+        void *p = NULL; size_t pl = 0;
+        check(bdiff_diff(old_big, SZ_128K, new_big, SZ_128K, &opts_t4, &p, &pl) == 0,
+              "T34 BDT4 diff ok");
+        const uint8_t *pb = (const uint8_t *)p;
+        int is_bdt4 = (pl >= 4 && pb[0]=='B' && pb[1]=='D' && pb[2]=='T' && pb[3]=='4');
+        check(is_bdt4, "T34 uses BDT4 magic for consecutive spots");
+        /* BDT4: 4B magic + 3B varint + 1 group(3+8=11) = 18B */
+        check(pl == 18, "T34 BDT4 size = 7 + 3 + 8 = 18B");
+        void *res = NULL; size_t rl = 0;
+        int r = bdiff_patch_opts(old_big, SZ_128K, p, pl, &opts_t4, &res, &rl);
+        check(r == 0 && rl == SZ_128K && memcmp(res, new_big, SZ_128K) == 0,
+              "T34 BDT4 roundtrip ok");
+        free(res);
+        printf("  T34  2 consecutive words     patch = %zuB (BDT4)\n", pl);
+        free(p);
+    }
+
+    /* ---- T35: BDT3 still used for isolated spots (BDT4 bigger) ---- */
+    {
+        fill_moderate(old_big, SZ_128K, 202); memcpy(new_big, old_big, SZ_128K);
+        /* 2 isolated spots far apart → BDT3 should be smaller */
+        for (int i = 0; i < 4; ++i) new_big[0x1000 + i] ^= 0xFF;
+        for (int i = 0; i < 4; ++i) new_big[0x7F00 + i] ^= 0xAA;
+        bdiff_opts opts_t5 = {16, SZ_128K, SZ_128K, 0, 0, 1};
+        void *p = NULL; size_t pl = 0;
+        check(bdiff_diff(old_big, SZ_128K, new_big, SZ_128K, &opts_t5, &p, &pl) == 0,
+              "T35 BDT3 vs BDT4 diff ok");
+        const uint8_t *pb = (const uint8_t *)p;
+        check(pb[0]=='B' && pb[1]=='D' && pb[2]=='T' && pb[3]=='3',
+              "T35 uses BDT3 for isolated spots");
+        check(pl == 19, "T35 BDT3 size = 7 + 12 = 19B");
+        void *res = NULL; size_t rl = 0;
+        int r = bdiff_patch_opts(old_big, SZ_128K, p, pl, &opts_t5, &res, &rl);
+        check(r == 0 && rl == SZ_128K && memcmp(res, new_big, SZ_128K) == 0,
+              "T35 BDT3 roundtrip ok");
+        free(res);
+        printf("  T35  2 isolated spots       patch = %zuB (BDT3)\n", pl);
+        free(p);
+    }
+
+    /* ---- T36: BDT4 decoder guard: bad group count overflow ---- */
+    {
+        /* Craft a BDT4 patch with a group whose count×4 overflows the payload */
+        uint8_t evil[4 + 3 + 3 + 4]; /* magic + varint(128K) + group hdr(3) + 1 val(4) */
+        size_t ei = 0;
+        evil[ei++]='B'; evil[ei++]='D'; evil[ei++]='T'; evil[ei++]='4';
+        evil[ei++]=0x80; evil[ei++]=0x80; evil[ei++]=0x08; /* varint 128K */
+        /* group: woff=0 (offset 0), count=10 → needs 40B payload but we only give 4 */
+        evil[ei++]=0x00; evil[ei++]=0x00; /* woff=0 */
+        evil[ei++]=10; /* count=10 */
+        for (int k=0;k<4;++k) evil[ei++]=0x42; /* only 1 value, need 10 */
+        bdiff_opts opts_g = {16, 0,0,0, 0, 1};
+        void *res = NULL; size_t rl = 0;
+        int r = bdiff_patch_opts(old_big, SZ_128K, evil, ei, &opts_g, &res, &rl);
+        check(r == BDIFF_E_FORMAT, "T36 BDT4 bad count → E_FORMAT");
+        free(res);
+        printf("  T36  BDT4 bad count guard   OK (E_FORMAT)\n");
+    }
+
     free(old_big); free(new_big);
     free(old); free(newd);
 
