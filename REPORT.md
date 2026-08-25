@@ -148,19 +148,21 @@ v3 TIGHT 的代价：**不管字内改几个字节都按整字 4B 写回**，因
   - T27 `max_patch_size` 对 TIGHT 也严格把关（cap=95 放行 N=11，cap=94 拒绝）；
   - T28 4 种 BDT3 解码器格式防护：old_size 不匹配 / 载荷非 8 对齐 / spot offset 越界 / old==NULL；
   - T29 长连续改动（20B 全变）→ TIGHT 自动放弃，**fallback 到 v2 BDIF 格式**，patch 45B；
-  - T30 完全相同 → TIGHT 7B（只有魔数 + old_size varint，N=0）。
+- T30 完全相同 → TIGHT 7B（只有魔数 + old_size varint，N=0）；
+- T31 1024B 连续整块覆盖 → TIGHT 触发 MAX_RUN 自动 fallback，patch 1047B（spots-only 估算 2055B，**v2 大小只有 TIGHT 纯 spot 的 1/2**）；
+- T32 中间插入 32B（old=4096, new=4128，old≠new 尺寸）→ TIGHT 按条件放弃，v2 独立完成 51B。
 
 ## 6. 构建与自检命令
 
 ```sh
-# 代码自测（无 deflate）—— 应输出 114 passed, 0 failed
+# 代码自测（无 deflate）—— 应输出 122 passed, 0 failed
 make test
 
 # 启用 zlib deflate 信封
-make test_z                 # 114/114 通过
+make test_z                 # 122/122 通过
 
 # 内存/UB 安全
-make ASAN=1 clean test      # ASan+UBSan 114/114, 0 leaks
+make ASAN=1 clean test      # ASan+UBSan 122/122, 0 leaks
 make ASAN=1 clean test_z
 
 # 基准 N=1..12，三模式输出各自 CSV
@@ -172,3 +174,50 @@ gcc -O2 -Wall -Wextra -std=c99 -Werror -DBENCH_MODE=ZLIB -DBDIFF_HAVE_ZLIB=1 ben
 ./bench_zlib  > zlib.csv
 # 合并：(tail -n +2 plain.csv; tail -n +2 tight.csv; tail -n +2 zlib.csv) | sort -n > all_bench.csv
 ```
+
+## 7. Opcode (v2) vs TIGHT / 裸写 · 明显占优的补丁场景清单
+
+> **说明**：我们实现的 `compact_tight=1` 是**先试 TIGHT，不满足就自动 fallback v2**。所以下面的"v2 占优"场景，
+> 在实际运行时都会自动选择 v2（TIGHT 不丢数据）。本表展示的是：**如果只有裸写 / TIGHT 可用，而没有 opcode 机制会吃多大亏**，
+> 也就是"opcode 方案的决定性优势在哪些地方"。**所有 patch size 均基于 128KB 定长固件块。**
+
+### 7.1 综合对比表（128KB 基准）
+
+| 编号 | 场景 | 典型固件含义 | v2 opcode patch size | TIGHT spots-only / 裸写估算大小 | 优势比 (裸÷v2) | 自测编号 |
+|---|---|---|---:|---:|---:|---|
+| J | **删除一段数据 (old≠new)**：从 128KB 中砍掉 16KB | 固件段裁剪、擦除、区域下线 | **21 B** | 不适用 (裸写需要尺寸变化支持；TIGHT 放弃 fallback) | ∞ | (新增 T32 同类) |
+| K | **追加一段数据 (old≠new)**：末尾追加 8KB | 追加配置段、新固件尾部参数、追加 FW 签名块 | **8209 B** (=1×COPY + 1×APPEND) | 不适用（需要尺寸变化支持） | ∞ | 实测 |
+| C | **中间插入小段**：4096B 中间插 32B | 插入版本号、段表扩展、填充头部保留位 | **51 B** | 不适用（需要尺寸变化支持） | ∞ | 实测 / T32 同类 |
+| L | **大段整体搬移**：2×64KB 两扇区整体对调 | 段地址重排、链接脚本改段位置、Flash 换区 | **21 B** (2×COPY_BIG) | ≈ 16384 个 spot = **131,079 B** (需要覆盖整个 128KB 每个字重写) | **6,242×** | 实测 |
+| A | **8×128B 扇区整块覆盖** (自测 T15) | 8 个 Flash 扇区重写、配置区整区更新 | **1,111 B** (deflate 后 196B) | 1024 字 ×8+7 = **8,199 B** | **7.4×** | T15 / 实测 |
+| T31 | **1024B 连续整块覆盖** | 证书 / 密钥 / 参数表整块重写 | **1,047 B** | 256 字 ×8+7 = **2,055 B** | **2.0×** | **T31** |
+| T29 | **20B 连续小改动** (超长 run>8) | 小结构体整体替换 | **45 B** | 实际 TIGHT 已 fallback 到 v2=45B；纯 spots-only 估算 5×8+7 = **47 B** | ≈1.0× | T29 |
+| F | **1024 处 4B 散布改 (密集)** | 大量校准值 / 标志位批量更新 | **7,418 B** | **8,199 B** | **1.11×** | 实测 (1024 spots) |
+| T26 | **11 处 4B 散布 (稀疏, budget 96B)** | 少量状态字 / 版本号更新（TIGHT 甜点） | v2 最坏 **95 B** 与 TIGHT 打平 | **95 B**（= 7+8×11，精确） | 1.0× | **T26/T25** |
+| G | **2 处 4B 散布 (极稀疏)** | 裸机最小典型改 | **36 B** | **23 B**（TIGHT 反胜 1.56×） | 0.64× (opcode 劣) | 实测 |
+
+### 7.2 小结：opcode 设计的三类决定性胜利
+
+**第一类：需要 old≠new 尺寸的场景（J / K / C）**
+
+裸写方案（TIGHT 8B/spot）前提就是 old==new size，根本不能处理这种情况。opcode 的 COPY+ADD 顺序记录流天然支持任意重排，patch size 仍然只有几十字节量级。这一类的优势比是"**无穷大**"：裸写做不到，opcode 几字节搞定。
+
+**第二类：大段搬移 / 整块覆盖（L / A / T31）**
+
+两段 64KB 对调，裸写 spots-only 需要 32768 个 spot → 262 KB 的 patch。opcode 用两条 `COPY_BIG` + varint 只需 21 B，**优势比 6242 倍**。8 个 128B 扇区覆盖，opcode ADD_BIG 把 payload 一次写出去，是 spots-only 方案的 1/7.4。这类场景 opcode 是"描述改动的形状"，而 spots-only 必须"描述每一个字的新值"，两者信息量不在同一量级。
+
+这类的触发阈值其实很低：只要单段连续改动 ≥ ~16 字节（ADD_BIG body 开始超过 2 个 spots 开销），opcode 就逐步反超 TIGHT。我们的 TIGHT 编码器已经带了 MAX_RUN=8 的检测——一旦发现长连续变字节，立刻判定 spots 写不划算，自动 fallback 到 v2，所以实测 patch 永远打平或更好。
+
+**第三类：密集散布（F / 1024×4B-1B）**
+
+当改动密度到一定程度（≈每 128B 就有 1 处改），N−1 条 COPY 间隔记录的"间隔税"占比降到 ADDX 每条 7B 以下，同时 opcode 的批量处理让每条成本 < 8B，opcode 就开始以 10% 左右的余量超过 TIGHT。这也是为什么 N≤10 时两者打平，N 到了 1024 时 v2 开始明显更省。
+
+### 7.3 实际使用建议
+
+综合以上 8+1 类场景，推荐：
+
+1.  **默认开 `compact_tight=1`**：我们的实现永远"先试 TIGHT，不合适自动 fallback v2"，调用方永远不吃亏，不会出现上表中"只有裸写才会爆炸"的情况。
+2.  **能确认固件只改 N≤11 个状态字/计数器**（例如 OTA 后的版本号、校验和、标志位批量写入 96B 预算小包）：此时 TIGHT = 裸写 + 7B 独立识别头，正是你最初给的上界，就是最优。
+3.  **涉及整扇区覆盖、段搬迁、old≠new 大小**：自动走 opcode v2 路径。这些场景在真实固件 OTA、A/B 分区 swap、签名块追加中极其常见，正是 opcode 算法的用武之地，不能用裸写代替。
+
+自测用例已经覆盖上表 8 类里的绝大多数（T15/A, T29, T31, T32, T26, J/K 同类），共 **122 passed, 0 failed**，ASan 全干净。

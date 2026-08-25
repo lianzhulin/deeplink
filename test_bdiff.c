@@ -558,6 +558,67 @@ int main(void) {
         printf("  T30  identical 128K  tight patch = %zuB\n", pl_id);
     }
 
+    /* ---------------- T31/T32: Opcode-advantaged scenarios ----------------
+     * Long contiguous rewrites or old≠new sizes: TIGHT MUST fall back to v2,
+     * since tight encoding these would be many times larger. */
+    printf("\n===[ v3 TIGHT auto-fallback → opcode wins ]===\n");
+    {
+        bdiff_opts opts_tk = { 16, SZ_128K, SZ_128K * 2, 0, 0, 1 }; /* allow new bigger */
+
+        /* T31 1024 bytes contiguous overwrite inside 128K.
+         * TIGHT spots-only would require ceil(1024/4)=256 spots *8 +7 = 2055B,
+         * but a single ADD_BIG should be < 1050B, and magic MUST be BDIF (fallback). */
+        fill_moderate(old_big, SZ_128K, 0xC0FFEEu); memcpy(new_big, old_big, SZ_128K);
+        for (size_t i = 0; i < 1024; ++i) new_big[0x1E000u + i] ^= (uint8_t)(0xA5u + (i & 0x3Fu));
+        void *p = NULL; size_t pl = 0;
+        check(bdiff_diff(old_big, SZ_128K, new_big, SZ_128K, &opts_tk, &p, &pl) == 0,
+              "T31 diff ok");
+        const uint8_t *pb = (const uint8_t *)p;
+        check(pb[0]=='B' && pb[1]=='D' && pb[2]=='I' && pb[3]=='F',
+              "T31 long overwrite → fallback, patch magic is BDIF (not BDT3)");
+        /* expected upper bound: 6B header + 3B vi(new_size) + 1B COPY_SMALL/COPY vi off(3)
+         * + 1B vi len(~2) + ADD_BIG op 1B + vi len 2B + vi old_off 3B + 1024B payload + tail copy
+         * → definitely way under 2000B (which is tight spots-only). */
+        check(pl < 2000, "T31 v2 patch < 2000B (tight spots-only = 2055B)");
+        {   /* roundtrip check */
+            void *res = NULL; size_t rl = 0;
+            int r = bdiff_patch_opts(old_big, SZ_128K, p, pl, &opts_tk, &res, &rl);
+            check(r == 0 && rl == SZ_128K && memcmp(res, new_big, SZ_128K) == 0,
+                  "T31 roundtrip ok");
+            free(res);
+        }
+        printf("  T31  1024B contiguous overwrite  patch = %zuB (BDIF fallback)\n", pl);
+        free(p);
+
+        /* T32 Insert 32 bytes in middle (old=4096 → new=4128, old≠new size).
+         * TIGHT requires old==new size, so MUST emit BDIF. Use small local buffers. */
+        uint8_t osmall[4096];
+        for (size_t i = 0; i < sizeof osmall; ++i) osmall[i] = (uint8_t)(i * 29u + 3u);
+        uint8_t *nsmall = (uint8_t *)malloc(4128);
+        memcpy(nsmall, osmall, 2000);
+        for (int i = 0; i < 32; ++i) nsmall[2000 + i] = (uint8_t)('A' + i);
+        memcpy(nsmall + 2032, osmall + 2000, 4096 - 2000);
+        {
+            void *p2 = NULL; size_t pl2 = 0;
+            bdiff_opts opts_small = opts_tk; opts_small.max_old_size = 5000;
+            opts_small.max_new_size = 5000;
+            check(bdiff_diff(osmall, 4096, nsmall, 4128, &opts_small, &p2, &pl2) == 0,
+                  "T32 diff insert 32 ok");
+            const uint8_t *p2b = (const uint8_t *)p2;
+            check(p2b[0]=='B' && p2b[1]=='D' && p2b[2]=='I' && p2b[3]=='F',
+                  "T32 old≠new size → magic is BDIF, not BDT3");
+            check(pl2 < 200, "T32 insert 32B patch small (<200B)");
+            void *res = NULL; size_t rl = 0;
+            int r = bdiff_patch_opts(osmall, 4096, p2, pl2, &opts_small, &res, &rl);
+            check(r == 0 && rl == 4128 && memcmp(res, nsmall, 4128) == 0,
+                  "T32 insert 32B roundtrip ok");
+            free(res);
+            printf("  T32  insert 32B (4096→4128)  patch = %zuB (BDIF only)\n", pl2);
+            free(p2);
+        }
+        free(nsmall);
+    }
+
     free(old_big); free(new_big);
     free(old); free(newd);
 
