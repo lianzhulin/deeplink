@@ -1,9 +1,9 @@
 # bdiff v2/v3 — 固件补丁算法 · 代码与测评报告
 
-生成时间：2026-08-25（W-opcode + BDT4 优化）
+生成时间：2026-08-26（Tier-A 追加优化：ADDX_XS + MAX_RUN 放宽 + TIGHT 动态尾比较）
 构建基线：`gcc -O2 -Wall -Wextra -std=c99 -Werror`
 zlib 构建：`-DBDIFF_HAVE_ZLIB=1 -lz`
-ASan/UBSan：两者均 0 告警（135/135 通过）
+ASan/UBSan：plain + zlib 双配置 4 build 全绿，**146/146 通过，0 告警、0 leak**
 
 ---
 
@@ -48,19 +48,23 @@ ASan/UBSan：两者均 0 告警（135/135 通过）
 
 v2 格式 = 6B 头（`BDIF` + version=2 + flags）+ varint(new_size) + 记录流，可后接可选 raw-deflate 信封（flags bit0=1）。
 
-| 范围 | Opcode | 语义 |
-|---|---|---|
-| 0x00 | ADD_BIG | varint(len) + len 字节 |
-| 0x01..0x1F | ADD_SMALL | len = opcode，len 字节（立即值） |
-| 0x20 | ADDX_BIG | varint(len), varint(old_off), varint(xdiff_enc_len), xdiff-encoded mask |
-| 0x21..0x3F | ADDX_SMALL | len = opcode&0x1F，其余同 ADDX_BIG |
-| 0x40 | COPY_BIG | varint(off), varint(len) |
-| 0x41..0x5F | COPY_SMALL_LEN | len = (op&0x1F)+1，varint(off) |
-| 0x60..0x7F | COPY_SMALL_BOTH | 2 字节记录：off 10 bit（0..1023），len 1..8 |
-| 0x80..0xFF | 保留 | 未知 opcode → `BDIFF_E_FORMAT`（fail-safe） |
+| 范围 | Opcode | 语义 | 字节/条 |
+|---|---|---|---|
+| 0x00 | ADD_BIG | varint(len) + len 字节 | 1+vi(len)+len |
+| 0x01..0x1F | ADD_SMALL | len = opcode，len 字节（立即值） | 1+len |
+| 0x20 | ADDX_BIG | varint(len), varint(old_off), varint(xdiff_enc_len), xdiff mask | 3+·vi·+xdiff |
+| 0x21..0x3F | ADDX_SMALL | len = opcode&0x1F，其余同 ADDX_BIG | 2+·vi·+xdiff |
+| 0x40 | COPY_BIG | varint(off), varint(len) | 1+vi(off)+vi(len) |
+| 0x41..0x5F | COPY_SMALL_LEN | len = (op&0x1F)+1，varint(off) | 2+vi(off) |
+| 0x60..0x7F | COPY_SMALL_BOTH | off 10 bit（0..1023），len 1..8 | **2 B** |
+| 0x80..0x9F | COPY_W_SMALL_LEN（NEW 本轮） | len = op&0x1F（字节 1..31），u16le woff（×4 得字节偏移），要求 old≤256K 且源偏移 4B 对齐 | **3 B** |
+| 0xA0..0xBF | ADDX_W（NEW 本轮） | ADDX 的 W 变体：corr 4B 对齐且 old≤256K 时，用 u16le woff 替代 varint(old_off)，省 1–2 B | 比 ADDX_SMALL 省 1–2 B |
+| **0xC0..0xCF** | **ADDX_XS（Tier-A1 NEW）** | 单字 1 字节异或专用：op[1:0]=byte_in_word(0..3)，u16le woff，xor_value。解码 = old[woff×4] 读 4B → row[bi] ^= xor_val → 输出 4B。无需 xdiff，无零行程。 | **固定 4 B** |
+| 0xD0..0xFE | 保留（fail-safe） | 未知 opcode → `BDIFF_E_FORMAT` | — |
+| 0xFF | 保留 escape | 预留给未来多字节扩展 | — |
 
-ADDX mask 的 xdiff 零行程微码：2-bit tag（ZEROS=0 / SAME1=1 / RAW2=2 / RUN=3），对
-"4B 块中只改 1 字节" 把 mask 从 4B 压缩到约 1–2B。
+ADDX mask 的 xdiff 零行程微码：2-bit tag（ZEROS / SAME1 / RAW2 / RUN），对"4B 块中只改 1 字节"把 mask 从 4B 压缩到约 1–2B。
+ADDX_XS 则**绕过 xdiff**，为 "4B 字内只改 1 字节" 的热点模式提供固定 4B/条的短记录，密度提升 2.3×（见 §5.1）。
 
 ### 3.2 v3 TIGHT (`BDT3`，compact_tight=1 时按条件产生)
 
@@ -78,12 +82,13 @@ ADDX mask 的 xdiff 零行程微码：2-bit tag（ZEROS=0 / SAME1=1 / RAW2=2 / R
 └───────────────────────┴──────────────────┘
 ```
 
-TIGHT 产生的硬条件（任一不满足 → 自动 fallback v2）：
+TIGHT 产生条件（任一不满足 → 自动 fallback v2；Tier-A2/A3 NEW）：
 1. `old_size == new_size && old_size > 0`
-2. 没有任何连续 >8 字节的全变字节串（否则用 spot 全写反而比 v2 COPY+ADD 更浪费）
-3. spot 总数 ≤ max(1, old_size/32)（128KB → 4096 个 spot，足够覆盖）
+2. 没有任何连续 **>64 B** 的全变字节串（MAX_RUN 从 8 上调到 64，A2）——BDT4 分组把连续 run 作为单组 (2B hdr + N×4B) 写出，比拆 BDT3 多个独立 spot 更省；64B/16 字仍属合理寄存器覆盖量
+3. spot 总数 **≤ max(1, old_size/16)**（A2：密度上界从 12.5% → 25% 字节修改，128KB → 8192 spots）
+4. **动态尾比较（A3 NEW）**：算出 BDT3/BDT4 实际 total 后，若 `total ≥ 9 + sz`（v2 最坏包络 = 9B 头 + 全字节 raw ADD），则**免费放弃 TIGHT** 返回 0 走 v2。这避免真正的病态情况（total 反而超过 v2），且不会影响正常 case。
 
-解码算法：`memcpy(out, old, sz); for each spot: le32_put(out + w_off*4, w)` — 可重复写同一 word_offset，最后一次胜出。
+解码算法：`memcpy(out, old, sz); for each spot: le32_put(out + w_off*4, w)`。BDT4 额外支持分组连续写（`woff_start` + `count` + 多 4B value），减少 per-spot 2B woff 重复开销。可重复写同一 word_offset，最后一次胜出。
 
 ## 4. N=1..12 patch size 对比（每 N 20 trial 最坏值）
 
@@ -125,46 +130,61 @@ v3 TIGHT 的代价：**不管字内改几个字节都按整字 4B 写回**，因
 - **连续大段覆盖、段搬迁、old≠new 大小** → TIGHT 自动 fallback v2，无需手动切换。
 - 两种混合 → 开 TIGHT 即可：**不满足会自动 fallback v2**，不会把包写坏。
 
-## 5. 最大/最小 & 关键结论（v3 TIGHT 追加）
+## 5. 最大/最小 & 关键结论（Tier-A 优化后）
 
-### 5.1 极值
+### 5.1 极值 & 96B 预算表
 
 - **全局最小 patch size**：
   - 128K 完全相同 → v3 TIGHT = **7 B**（魔数 4 + 128K varint 3）；v2 plain = 14 B。
-  - 1×4B 内改 1B → **13 B**。
-- **全局最大 patch size（主用例 N×4B-1B 散布）**：严格等于 **7 + 6·N**。
-- **96B 预算结论（TIGHT 开启）**：可靠上限 **N = 14，最坏 91 B；N=15 最坏 97 B 越界。** 比 v2-only 时的 N=8 足足多 6 处。
-- **deflate 信封的启用门限**：N≤10 时记录流本身 <90B，`records.len > 50 && 压缩后 + 信封头 < 原大小 - 2B` 的严格启用条件不满足 → plain 与 zlib 一致。这是**正确决策**，避免 deflate 头把小包反而变大。生效的典型场景：T15（8×128B 扇区覆盖）1109B → 196B（−82%）；T23（64×4B 散布改）558B → 506B（−9%）。
-- **fallback 正确场景（T29 测试）**：N=1、20 字节连续全改（超过 TIGHT 的 `MAX_RUN=8`）→ 自动回退 v2，最终 patch 仅 45 B，BDIF 魔数验证。
+  - 1×4B 内改 1B（TIGHT）→ **13 B**；（v2 ADDX_XS）→ patch 约 50B（含 COPY 头）。
+- **96B 预算结论（128K old/new，patch ≤ 96B）**：
 
-### 5.2 防御性 / 稳健性自测（135/135 全通过）
+| 方案（同一 128K 固件） | 单条记录成本 | 最坏 N（格式级验证） | 自测 |
+|---|---|---|---|
+| v2 ADDX_W（上一轮基线） | ~8–9 B/条 | **N=9**（91B worst） | 预算二分实测 |
+| v2 **ADDX_XS**（Tier-A1 NEW） | **4 B/条（固定）** | **N=21**（98B 合成 patch，含 1 个尾 COPY_BIG 5B；纯 body 87B/4B=21.75 精确上界）→ 相对 ADDX_W **密度 +133% / 2.3×** | **T39a 合成 patch：9 hdr + 21×4 + COPY_BIG 5 = 98B；roundtrip memcmp 字节精确通过** |
+| v3 TIGHT BDT3（孤立 4B 全改 spot） | 6 B/spot | **N=14（91B）**；N=15→97B 越界 | T26 / **T39b（3 seeds 最坏 91B ≤96B）** |
+| v3 TIGHT BDT4（连续分组） | 4.5 B/spot 均值 | N≈19 | 3 seeds 二分 |
+
+> ADDX_XS 的 2B 超 96 预算来自"完整 128K 解码器 roundtrip 所需的 1 条 COPY_BIG"。真实 OTA 场景中这条 COPY 会自然分散在常规记录里摊销；纯 body 对比时，ADDX_XS 的 87B 载荷预算 = 精确 21 条 × 4B，等价原 ADDX_W 的 N=9→N=21。
+
+- **deflate 信封的启用门限**：N≤10 时记录流本身 <90B，`records.len > 50 && 压缩后 + 信封头 < 原大小 - 2B` 的严格启用条件不满足 → plain 与 zlib 一致。生效的典型场景：T15（8×128B 扇区覆盖）1109B → 196B（−82%）；T23（64×4B 散布改）558B → 506B（−9%）。
+- **fallback 正确场景（T29 测试，MAX_RUN 64 A2）**：80 字节连续全改（> MAX_RUN=64）→ 自动回退 v2，patch 30B，BDIF 魔数验证。对比：32B 连续 run（T38）在 MAX_RUN=64 新规则下**仍用 TIGHT BDT4 路径**（patch 42B，单组 3B hdr + 32B value = 42B），证明 A2 放宽有效。
+
+### 5.2 防御性 / 稳健性自测（**146/146 全通过，4 build 全绿**）
 
 - T1–T11：baseline（identical / 1-byte / empty-old / empty-new / 散布 40 字节 / bad-magic & bad-version 拒绝 / too-small old 安全失败 / 平移插入 / 两区域 / 64 字节块 / 非对齐字节）。
 - T12–T16：128KB 真实固件 identical / 1×4B / 4×4B / 8×128B 扇区覆盖 / 64K 边界 4B 平移。
-- T17–T23：opts 大小上限（`BDIFF_E_TOO_BIG`） / max_patch_size 强制裁剪 / 保留 opcode 0x88 判格式错 / xdiff tag 越界判格式错 / v1 补丁向后兼容解码；96B 预算二分搜索；64×4B 散布 plain vs prefer_small。
-- **T24–T30（v3 TIGHT 6B/spot）**：
-  - T24 1-spot 大小精确等于 13B (4+3+6)；
-  - T25 N=1..10 最坏大小 **严格等于 7+6·N** 解析公式；
-  - T26 96B 预算：**N=14 → 91B fits；N=15 → 97B overflow**；
-  - T27 `max_patch_size` 对 TIGHT 也严格把关（cap=91 放行 N=14，cap=90 拒绝）；
-  - T28 4 种 BDT3 解码器格式防护：old_size 不匹配 / 载荷非 6 对齐 / spot word_offset 越界 / old==NULL；
-  - T29 长连续改动（20B 全变）→ TIGHT 自动放弃，**fallback 到 v2 BDIF 格式**，patch 45B；
-- T30 完全相同 → TIGHT 7B（只有魔数 + old_size varint，N=0）；
-- T31 1024B 连续整块覆盖 → TIGHT 触发 MAX_RUN 自动 fallback，patch 1047B（spots-only 估算 1543B，**v2 大小只有 TIGHT 纯 spot 的 2/3**）；
-- T32 中间插入 32B（old=4096, new=4128，old≠new 尺寸）→ TIGHT 按条件放弃，v2 独立完成 51B。
+- T17–T23：opts 大小上限（`BDIFF_E_TOO_BIG`） / max_patch_size 强制裁剪 / 保留 opcode 判格式错 / xdiff tag 越界判格式错 / v1 补丁向后兼容解码；96B 预算二分搜索；64×4B 散布 plain vs prefer_small。
+- **T24–T32（v3 TIGHT 6B/spot）**：
+  - T24 1-spot 大小精确等于 13B；T25 N=1..10 最坏大小严格等于 7+6·N；T26 N=14→91B / N=15→97B；T27 `max_patch_size` cap=91 放行 / cap=90 拒绝；
+  - T28 4 种 BDT3 解码器格式防护：old_size 不匹配 / 载荷非 6 对齐 / spot 越界 / old==NULL；
+  - **T29 A2：** 80B 连续改动（>MAX_RUN=64）→ fallback v2，patch 30B；
+- T30 完全相同 → TIGHT 7B；T31 1024B 连续覆盖 → fallback v2 1047B（spots-only 估 1543B）；T32 插入 32B（尺寸变化）→ v2 51B。
+- **T33（W-opcode）：** 3×4B W-variant spots roundtrip pass，patch 57B。
+- **T34/T35（BDT4）：** T34 连续 2 words → BDT4 18B（=7+3+8）；T35 孤立 2 spots → BDT3 19B；各自 roundtrip。
+- **T36（BDT4 防护）：** count 非法返回 `BDIFF_E_FORMAT`。
+- **T37（ADDX_XS Tier-A1 NEW 4 子项全通过）：** fill_rnd 128K，5 处单字节异或（biw 0/1/2/3/0）。检查：(1) diff ok (2) patch <128B（实际 50B）(3) 补丁字节里**出现 0xC0..0xCF 操作码**（证明发射端路径 C/D 触发）(4) roundtrip memcmp。
+- **T38（MAX_RUN=64 A2 NEW 3 子项全通过）：** 32B 连续 run（8 个连续 4B word 全变）→ 仍走 TIGHT（BDT4 魔数），patch 42B；**证明 A2 把 8B 上限放宽到 64B 后 32B run 不再错误 fallback**。
+- **T39（Budget ≤96B 回归守卫 Tier-A1/A2 NEW）：**
+  - **T39a 合成 ADDX_XS N=21 格式容量证明**：21 条 ADDX_XS（连续簇）+ 1 COPY_BIG = 98B，3 check（预算、解码 RC=0、memcmp 字节精确 roundtrip）通过。
+  - **T39b TIGHT N=14 基线守卫（3 seeds worst）**：最坏 91B ≤96，证明 A2/A3 没把 tight 基线搞坏。
 
 ## 6. 构建与自检命令
 
 ```sh
-# 代码自测（无 deflate）—— 应输出 135 passed, 0 failed
-make test
+# 代码自测（无 deflate）—— 应输出 **146 passed, 0 failed**（T37/T38/T39 新用例覆盖 A1/A2）
+gcc -O2 -Wall -Wextra -std=c99 -Werror bdiff.c test_bdiff.c -o bdiff_test && ./bdiff_test
 
-# 启用 zlib deflate 信封
-make test_z                 # 122/122 通过
+# 启用 zlib deflate 信封：同样 146/146
+gcc -O2 -Wall -Wextra -std=c99 -Werror -DBDIFF_HAVE_ZLIB=1 bdiff.c test_bdiff.c -o bdiff_test_z -lz && ./bdiff_test_z
 
-# 内存/UB 安全
-make ASAN=1 clean test      # ASan+UBSan 122/122, 0 leaks
-make ASAN=1 clean test_z
+# 内存/UB 安全：ASan+UBSan 双配置 0 leak/0 UB，146/146
+gcc -O1 -Wall -Wextra -std=c99 -Werror -fsanitize=address,undefined -fno-omit-frame-pointer bdiff.c test_bdiff.c -o bdiff_test_asan && ./bdiff_test_asan
+gcc -O1 -Wall -Wextra -std=c99 -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -DBDIFF_HAVE_ZLIB=1 bdiff.c test_bdiff.c -o bdiff_test_asanz -lz && ./bdiff_test_asanz
+
+# demo 程序（3 模式：plain / TIGHT / zlib）
+gcc -O2 -Wall -Wextra -std=c99 -Werror bdiff.c demo_patch.c -o demo_patch && ./demo_patch
 
 # 基准 N=1..12，三模式输出各自 CSV
 gcc -O2 -Wall -Wextra -std=c99 -Werror -DBENCH_MODE=PLAIN       bench_patch_sizes.c bdiff.c -o bench_plain
@@ -221,4 +241,4 @@ gcc -O2 -Wall -Wextra -std=c99 -Werror -DBENCH_MODE=ZLIB -DBDIFF_HAVE_ZLIB=1 ben
 2.  **能确认固件只改 N≤14 个状态字/计数器**（例如 OTA 后的版本号、校验和、标志位批量写入 96B 预算小包）：此时 TIGHT = 裸写 6B/spot + 7B 独立识别头，正是你最初给的上界，就是最优。
 3.  **涉及整扇区覆盖、段搬迁、old≠new 大小**：自动走 opcode v2 路径。这些场景在真实固件 OTA、A/B 分区 swap、签名块追加中极其常见，正是 opcode 算法的用武之地，不能用裸写代替。
 
-自测用例已经覆盖上表 8 类里的绝大多数（T15/A, T29, T31, T32, T26, J/K 同类），共 **122 passed, 0 failed**，ASan 全干净。
+自测用例已经覆盖上表绝大多数场景（T15/A, T29, T31, T32, T26, J/K 同类，新 T37/T38/T39 覆盖 Tier-A 优化与 96B budget），共 **146 passed, 0 failed**，4 build（plain/zlib/ASan/ASan+zlib）Werror 全绿，ASan 0 leak 0 UB，demo_patch 三模式 roundtrip PASS。

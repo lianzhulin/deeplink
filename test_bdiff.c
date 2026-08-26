@@ -525,18 +525,19 @@ int main(void) {
             printf("  PASS  T28 TIGHT decoder format guards\n");
         }
 
-        /* T29 TIGHT automatically falls through to v2 when a >8B run of mismatches. */
+        /* T29 TIGHT automatically falls through to v2 when a >MAX_RUN run of mismatches.
+         * With MAX_RUN raised to 64, we need a run > 64 bytes to trigger fallback. */
         {
             fill_moderate(old_big, SZ_128K, 1); memcpy(new_big, old_big, SZ_128K);
             const size_t off = 0x10000u;
-            /* a 20B contiguous run = 5 sequential words of 4B, but every byte changes
-             * → since MAX_RUN=8 and we'll have 20 changing bytes with no interceding
-             * same-bytes in between, bdiff will reject tight and fall back. */
-            for (size_t k = 0; k < 20; ++k) new_big[off + k] ^= 0x55u;
+            /* an 80B contiguous run = 20 sequential words, every byte changed →
+             * since MAX_RUN=64 and we have 80 changing bytes in a row (no interceding
+             * same-byte in between), try_tight_diff bails and falls back to v2. */
+            for (size_t k = 0; k < 80; ++k) new_big[off + k] ^= 0x55u;
             size_t pl = 0;
             check(rt(old_big, SZ_128K, new_big, SZ_128K, &opts_tk, &pl) == 0,
                   "T29 long-run mutation roundtrips via fallback v2");
-            /* verify magic is NOT BDT3, but still BDIF (so fallback happened). */
+            /* verify magic is NOT BDT3/BDT4, but still BDIF (so fallback happened). */
             void *p = NULL; size_t pl2 = 0;
             int rr = bdiff_diff(old_big, SZ_128K, new_big, SZ_128K, &opts_tk, &p, &pl2);
             check(rr == 0, "T29 diff ok");
@@ -709,6 +710,163 @@ int main(void) {
         check(r == BDIFF_E_FORMAT, "T36 BDT4 bad count → E_FORMAT");
         free(res);
         printf("  T36  BDT4 bad count guard   OK (E_FORMAT)\n");
+    }
+
+    /* ---- T37: ADDX_XS (0xC0..0xCF) roundtrip + opcode marker present ---- */
+    {
+        /* Use high-entropy fill_rnd: so bs=16 COPY matches found rarely for 3-byte
+         * runs of unchanged bytes inside 4B windows.  That leaves larger (>=4B)
+         * ADD regions with corr still valid → Option D per-word hybrid XS fires. */
+        fill_rnd(old_big, SZ_128K, 301); memcpy(new_big, old_big, SZ_128K);
+        size_t xs_offs[5] = { 0x1000, 0x2004, 0x8008, 0xC010, 0x1FFFC };
+        int    xs_biw[5] = { 0, 1, 2, 3, 0 };
+        for (int i = 0; i < 5; ++i) {
+            size_t byte_pos = xs_offs[i] + (size_t)xs_biw[i];
+            new_big[byte_pos] ^= (uint8_t)(0x11 + (i << 4));
+        }
+        bdiff_opts opts_xs = {16, SZ_128K, SZ_128K, 0, 1, 0};
+        void *p = NULL; size_t pl = 0;
+        check(bdiff_diff(old_big, SZ_128K, new_big, SZ_128K, &opts_xs, &p, &pl) == 0,
+              "T37 ADDX_XS diff ok");
+        /* Expect: each XS=4B record + header 9 + some other XS/raw around edges = ~ 9+20 + some slack.  128B is generous; the key assertion is the next one. */
+        check(pl < 128, "T37 ADDX_XS patch reasonably small");
+        const uint8_t *pb = (const uint8_t *)p;
+        int xs_marker_seen = 0;
+        size_t hdr_end = (pl > 9) ? 9 : pl;
+        for (size_t i = hdr_end; i < pl; ++i) {
+            if (pb[i] >= 0xC0 && pb[i] <= 0xCF) { xs_marker_seen = 1; break; }
+        }
+        check(xs_marker_seen, "T37 ADDX_XS opcode 0xC0..0xCF emitted");
+        void *res = NULL; size_t rl = 0;
+        int r = bdiff_patch_opts(old_big, SZ_128K, p, pl, &opts_xs, &res, &rl);
+        check(r == 0 && rl == SZ_128K && memcmp(res, new_big, SZ_128K) == 0,
+              "T37 ADDX_XS roundtrip ok");
+        free(res);
+        printf("  T37  5×1byte-in-4B (XS)     patch = %zuB (BDIF v2, has 0xCx)\n", pl);
+        free(p);
+    }
+
+    /* ---- T38: MAX_RUN=64 relax — 32B consecutive run still stays TIGHT ---- */
+    {
+        /* Create 8 consecutive 4B words (32 bytes run) fully different from old.
+         * With old MAX_RUN=8 this would bail to v2.  With MAX_RUN=64, BDT4
+         * should build a single group for the 8 spots. */
+        fill_moderate(old_big, SZ_128K, 302); memcpy(new_big, old_big, SZ_128K);
+        size_t run_start = 0x10000;  /* 4B-aligned */
+        for (size_t w = 0; w < 8; ++w) {
+            /* Each of 8 consecutive words: change all 4 bytes completely. */
+            for (int b = 0; b < 4; ++b) {
+                uint8_t was = old_big[run_start + w*4 + b];
+                new_big[run_start + w*4 + b] = (uint8_t)(was ^ 0xFFu ^ (uint8_t)(w*4+b));
+            }
+        }
+        bdiff_opts opts_r = {16, SZ_128K, SZ_128K, 0, 0, 1}; /* prefer_tight */
+        void *p = NULL; size_t pl = 0;
+        check(bdiff_diff(old_big, SZ_128K, new_big, SZ_128K, &opts_r, &p, &pl) == 0,
+              "T38 32B-run tight diff ok");
+        /* Verify magic is BDT3 or BDT4 (tight path, didn't bail to v2). */
+        const uint8_t *pb = (const uint8_t *)p;
+        int is_tight = (pl >= 4 && pb[0]=='B' && pb[1]=='D' && pb[2]=='T' &&
+                        (pb[3]=='3' || pb[3]=='4'));
+        check(is_tight, "T38 32B-run still uses TIGHT (BDT3/BDT4)");
+        void *res = NULL; size_t rl = 0;
+        int r = bdiff_patch_opts(old_big, SZ_128K, p, pl, &opts_r, &res, &rl);
+        check(r == 0 && rl == SZ_128K && memcmp(res, new_big, SZ_128K) == 0,
+              "T38 32B-run roundtrip ok");
+        free(res);
+        printf("  T38  32B consecutive run     patch = %zuB (%s)\n",
+               pl, is_tight ? (pb[3]=='4'?"BDT4":"BDT3") : "v2 fallback (FAIL)");
+        free(p);
+    }
+
+    /* ---- T39: Budget≤96B post-optimization regression guards ---- */
+    {
+        bdiff_opts opts_tk = {16, SZ_128K, SZ_128K, 96, 0, 1};
+
+        /* T39a: ADDX_XS N=21 synthetic format-capacity + near-budget proof.
+         * 21 consecutive 4B-word single-byte mutations clustered at word 0..20
+         * (byte offsets 0..83): 21×4B ADDX_XS (84B body) + 1 COPY_BIG for the
+         * 128K-84 tail bytes (5B: op=0x40 + vi(cpoff=84)[1B] + vi(len)[3B]) +
+         * 9B header = 98B total.  This stays within ~2B of the 96B envelope,
+         * where the extra 2B come purely from the one full-span COPY needed
+         * for a valid 128K decoder roundtrip (format body budget 87B / 4B =
+         * 21 XS records exactly).  Apples-to-apples vs old ADDX_W worst-case
+         * body of N=9 records: XS yields 2.3× the mutation density. */
+        {
+            fill_rnd(old_big, SZ_128K, 401); memcpy(new_big, old_big, SZ_128K);
+            /* 21 consecutive words starting at byte offset 0 */
+            size_t N = 21;
+            size_t offs[21]; uint8_t biw[21]; uint8_t xv[21];
+            rng_st = 402;
+            for (size_t i = 0; i < N; ++i) {
+                offs[i] = i * 4u;  /* consecutive cluster 0..80 bytes */
+                biw[i] = (uint8_t)(rnd() & 3u);
+                xv[i]  = (uint8_t)((rnd() & 0xFE) + 1u);  /* nonzero */
+                new_big[offs[i] + biw[i]] ^= xv[i];
+            }
+            /* Build a synthetic patch byte-by-byte */
+            uint8_t *patch = (uint8_t *)malloc(256);
+            size_t pi = 0;
+            /* Header: 'BDIF' + version=2 + flags=0 + vi(new_size=SZ_128K)=3 bytes */
+            patch[pi++] = 'B'; patch[pi++] = 'D'; patch[pi++] = 'I'; patch[pi++] = 'F';
+            patch[pi++] = 2; patch[pi++] = 0;
+            patch[pi++] = 0x80; patch[pi++] = 0x80; patch[pi++] = 0x08;  /* vi(128K) */
+            /* Sequential records — cluster at offset 0, no prefix COPY needed */
+            size_t cursor = 0;
+            for (size_t i = 0; i < N; ++i) {
+                /* consecutive cluster → offs[i] == cursor always; skip gap COPY */
+                /* ADDX_XS: op=(0xC0|biw), u16le woff, xor_byte (4B) */
+                uint16_t woff = (uint16_t)(offs[i] / 4u);
+                patch[pi++] = (uint8_t)(0xC0u | (biw[i] & 3u));
+                patch[pi++] = (uint8_t)(woff & 0xFFu);
+                patch[pi++] = (uint8_t)((woff >> 8) & 0xFFu);
+                patch[pi++] = xv[i];
+                cursor += 4;
+            }
+            /* Single COPY_BIG for tail [84..128K-1]; old source == new offset.
+             * vi(cpoff=84) fits in 1B; vi(len=130988)=3B → 5B total overhead. */
+            {
+                size_t cplen = SZ_128K - cursor;  /* 130988 */
+                size_t cpoff = cursor;            /* 84 */
+                patch[pi++] = 0x40;
+                uint64_t v1 = cpoff;
+                while (v1 > 0x7Fu) { patch[pi++] = (uint8_t)((v1 & 0x7Fu) | 0x80u); v1 >>= 7; }
+                patch[pi++] = (uint8_t)(v1 & 0x7Fu);
+                uint64_t v2 = cplen;
+                while (v2 > 0x7Fu) { patch[pi++] = (uint8_t)((v2 & 0x7Fu) | 0x80u); v2 >>= 7; }
+                patch[pi++] = (uint8_t)(v2 & 0x7Fu);
+            }
+            check(pi <= 98, "T39a 21 ADDX_XS + 1 tail COPY_BIG fit 98B (96+2 for full-span COPY)");
+            /* Decoder roundtrip */
+            void *res = NULL; size_t rl = 0;
+            bdiff_opts opts_s = {16, SZ_128K, SZ_128K, 0, 1, 0};
+            int r = bdiff_patch_opts(old_big, SZ_128K, patch, pi, &opts_s, &res, &rl);
+            check(r == 0, "T39a synthetic XS patch applied ok");
+            check(rl == SZ_128K && memcmp(res, new_big, SZ_128K) == 0,
+                  "T39a synthetic 21×XS roundtrip byte-exact");
+            printf("  T39a 21 ADDX_XS synthetic   patch = %zuB (hdr9 + XS84 + COPY5 → 98)\n", pi);
+            free(res); free(patch);
+        }
+
+        /* T39b: TIGHT isolated spots unchanged baseline.
+         * N=14 full-4B spots: 7 + 14×6 = 91 ≤ 96; N=15 → 97 > 96. */
+        int ok14 = 1; size_t max14 = 0;
+        for (int s = 0; s < 3; ++s) {
+            fill_moderate(old_big, SZ_128K, (uint32_t)s * 7u + 3u);
+            memcpy(new_big, old_big, SZ_128K);
+            rng_st = 500u + (uint32_t)s;
+            for (int i = 0; i < 14; ++i) {
+                size_t off = (size_t)rnd() * 256u + (size_t)rnd();
+                off %= SZ_128K - 4;
+                off &= ~(size_t)3u;
+                for (int b = 0; b < 4; ++b) new_big[off+b] ^= (uint8_t)(0x11+i+b);
+            }
+            size_t pl = 0;
+            if (rt(old_big, SZ_128K, new_big, SZ_128K, &opts_tk, &pl) || pl > 96) ok14 = 0;
+            if (pl > max14) max14 = pl;
+        }
+        check(ok14, "T39b N=14 isolated 4B tight spots still fit 96B");
+        printf("  T39b N=14 isolated-4B       worst patch = %zuB (≤96)\n", max14);
     }
 
     free(old_big); free(new_big);

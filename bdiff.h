@@ -78,8 +78,23 @@ extern "C" {
  *   0xA1..0xBF       ADDX_W_SMALL: len = (opcode&0x1F) (1..31),
  *                               then u16le(woff),
  *                               varint(xdiff_enc_len), encoded bytes
+ *  ADDX_XS (extra-small, emitted for the dominant firmware "4B-word
+ *  single-byte flag/counter update" case) ----------------------------
+ *   Prerequisites: region len==4 (one 4B word), offset is 4B-aligned,
+ *   old_size ≤ 256KB (woff fits u16), AND the XOR mask (old XOR new)
+ *   has exactly ONE non-zero byte (other three bytes unchanged, so
+ *   ADDX xdiff encoding wastes 3-4 bytes describing zero runs).
+ *   0xC0..0xCF  ADDX_XS record (4 bytes TOTAL, fixed shape):
+ *                  bits [1:0] of opcode  = byte_in_word (0..3)
+ *                  bits [7:2] of opcode  = 0x30 (0b1100xx marker)
+ *                  followed by u16le(word_offset)  2 bytes
+ *                  followed by xor_byte             1 byte
+ *                Decoder does:
+ *                  out = old[woff*4 .. woff*4+3] (4 bytes copied)
+ *                  out[byte_in_word] ^= xor_byte
+ *                Produces exactly 4 bytes; no varint, no xdiff stream.
  *  Reserved ---------
- *   0xC0..0xFE       reserved (fail-safe: unknown opcode => E_FORMAT)
+ *   0xD0..0xFE       reserved (fail-safe: unknown opcode => E_FORMAT)
  *   0xFF             reserved escape for future extensions
  *
  * xdiff encoding (used inside ADDX):

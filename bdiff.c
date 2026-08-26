@@ -149,13 +149,17 @@ static int try_tight_diff(const uint8_t *old, size_t sz,
      * If the buffer is larger, TIGHT cannot be used; fall back to v2. */
     if (sz / 4 > 65535u) return 0;
 
-    /* Heuristic bail thresholds: if #spots exceeds 1/8 of buffer words
-     * (~= 12.5% of bytes changed), tight encoding no longer beats v2
-     * opcode-records because 6B-per-spot * many spots > raw ADD of the
-     * whole buffer.  Also bail if a diff run is wider than 8 bytes (two
-     * adjacent 4B words is fine). */
-    const size_t MAX_SPOTS = sz / 32; /* e.g. 128KB → 4096 spots (~256 μs) */
-    const size_t MAX_RUN   = 8;
+    /* Heuristic bail thresholds: raise MAX_SPOTS to sz/16 (was sz/32)
+     * because BDT4 group amortization drops per-spot cost well below 6B;
+     * the tail now also does a tight-vs-v2 dynamic comparison so truly
+     * pathological cases still fall back to v2 records.
+     * MAX_RUN raised from 8 to 64: decoder never had a run cap; emitter
+     * cap was overly conservative and forced BDT4 to only build 2-word
+     * groups.  64 bytes (=16 consecutive 4B words) still stays well
+     * within "a few overwritten registers" semantics and lets BDT4
+     * amortize its 3B group header over 16 spots instead of 2. */
+    const size_t MAX_SPOTS = sz / 16; /* e.g. 128KB → 8192 spots */
+    const size_t MAX_RUN   = 64;
 
     /* Collect spots on a temp array, then sort & dedupe offsets just in
      * case a 4B boundary got hit twice by the per-byte scan. */
@@ -235,6 +239,18 @@ static int try_tight_diff(const uint8_t *old, size_t sz,
     /* Pick the smaller format. */
     int use_bdt4 = (total4 < total3);
     size_t total = use_bdt4 ? total4 : total3;
+
+    /* A3: dynamic fall-back.  Even if we got here, if the tight patch
+     * would be bigger than a crude v2 "ADD everything" envelope (header
+     * 9B + sz bytes of raw) then tight is losing and the caller should
+     * fall through to v2 records which can still compress better. */
+    {
+        size_t v2_worst = 9 + sz;   /* BDIF header + full-block raw ADD */
+        if (total >= v2_worst) {
+            free(offs); free(vals);
+            return 0;
+        }
+    }
 
     if (opts->max_patch_size && total > opts->max_patch_size) {
         free(offs); free(vals); *fail_rc = BDIFF_E_TOO_BIG; return -1;
@@ -496,49 +512,197 @@ static int emit_add_by_offset(obuf *o,
     size_t size_b = (size_t)-1;
     uint8_t *hdr_b = NULL; size_t hdr_b_len = 0;
     uint8_t *xdiff_enc = NULL; size_t xdiff_enc_len = 0;
+    uint8_t *tmp = NULL; /* kept alive for Option D hybrid XS scan */
+    /* --- Option C: single-word ADDX_XS (0xC0..0xCF) 4B/record --- */
+    int    try_c = 0;
+    size_t size_c = (size_t)-1;
+    uint8_t xs_biw = 0;
+    uint8_t xs_xor = 0;
+    /* --- Option D: hybrid chunked per-4B-word (mix of ADDX_XS + raw ADD)
+     * When large ADD region (len>=4) is 4B-aligned and corr is valid,
+     * scan each 4B word independently; words with exactly 1 nonzero byte
+     * in their XOR mask are emitted as ADDX_XS (4B each).  Remaining
+     * bytes are emitted as grouped raw ADD runs.  This beats bulk
+     * ADDX/raw when the region is a sparse collection of 1-byte flag
+     * updates inside 4B words surrounded by unchanged bytes that the
+     * suffix-array segmentation couldn't COPY-split out individually. */
+    int    try_d = 0;
+    size_t size_d = (size_t)-1;
+    unsigned char *d_xs = NULL; /* per-4B-word: 0/1 if ADDX_XS eligible */
 
     if (try_b) {
-        /* Compute xor-diff. */
-        uint8_t *tmp = (uint8_t *)malloc(new_len ? new_len : 1);
+        tmp = (uint8_t *)malloc(new_len ? new_len : 1);
         if (!tmp) goto no_b;
         for (size_t k = 0; k < new_len; ++k)
             tmp[k] = new_bytes[k] ^ old_buf[corresponding_old_offset + k];
+        /* Single-word ADDX_XS (Option C) */
+        if (new_len == 4 &&
+            (old_size / 4 <= 65535u) &&
+            ((corresponding_old_offset & 3u) == 0)) {
+            int nz = 0; int bi = -1;
+            for (int z = 0; z < 4; ++z) if (tmp[z]) { nz++; bi = z; }
+            if (nz == 1) {
+                try_c = 1;
+                size_c = 4;
+                xs_biw = (uint8_t)bi;
+                xs_xor = tmp[bi];
+            }
+        }
+        /* Option D: scan every 4B word of the region */
+        if (new_len >= 4 &&
+            (old_size / 4 <= 65535u) &&
+            ((corresponding_old_offset & 3u) == 0)) {
+            size_t nwords = new_len / 4u;
+            d_xs = (unsigned char *)calloc(nwords ? nwords : 1, 1);
+            if (!d_xs) goto no_d_mem;
+            int xs_count = 0;
+            for (size_t w = 0; w < nwords; ++w) {
+                size_t base = w * 4u;
+                int nz = 0;
+                for (int z = 0; z < 4; ++z) if (tmp[base+z]) { nz++; }
+                if (nz == 1) { d_xs[w] = 1; xs_count++; }
+            }
+            if (xs_count > 0) {
+                /* Estimate cost: XS words × 4B, plus non-XS runs grouped
+                 * into raw ADD records (1B op + runlen bytes each). */
+                size_t cost = (size_t)xs_count * 4u;
+                size_t i = 0;
+                while (i < new_len) {
+                    size_t w = i / 4u;
+                    if (w < nwords && d_xs[w] && (i % 4 == 0)) {
+                        /* covered by XS above, skip 4 */
+                        i += 4;
+                    } else {
+                        /* start a raw ADD run */
+                        size_t run = 0;
+                        size_t j = i;
+                        while (j < new_len) {
+                            size_t wj = j / 4u;
+                            if (wj < nwords && (j % 4 == 0) && d_xs[wj]) break;
+                            run++; j++;
+                        }
+                        if (run) {
+                            if (run <= 31) cost += 1 + run;
+                            else           cost += 1 + vi_size((uint64_t)run) + run;
+                        }
+                        i = j;
+                    }
+                }
+                try_d = 1;
+                size_d = cost;
+            }
+no_d_mem:;
+        }
         xdiff_enc_len = xdiff_encode(tmp, new_len, &xdiff_enc);
-        free(tmp);
         if (!xdiff_enc_len) {
             free(xdiff_enc); xdiff_enc = NULL;
-            goto no_b;
+            if (!try_c && !try_d) {
+                free(tmp); tmp = NULL;
+                goto no_b;
+            }
+            xdiff_enc = NULL; xdiff_enc_len = 0;
         }
-        /* Build header shape: use W-variant (u16 word_offset) when
-         * old_size ≤ 256KB and offset is 4B-aligned; saves 1B. */
-        int use_w = (old_size / 4 <= 65535u &&
-                     (corresponding_old_offset & 3u) == 0);
-        hdr_b = (uint8_t *)malloc(1 + 10 + 10 + 2);
-        if (!hdr_b) goto no_b;
-        size_t w = 0;
-        if (new_len >= 1 && new_len <= 31) {
-            hdr_b[w++] = (uint8_t)(use_w ? 0xA0 : 0x20) | (uint8_t)new_len;
-        } else {
-            hdr_b[w++] = use_w ? 0xA0 : 0x20;
-            w += vi_enc((uint64_t)new_len, hdr_b + w);
+        if (xdiff_enc_len) {
+            int use_w = (old_size / 4 <= 65535u &&
+                         (corresponding_old_offset & 3u) == 0);
+            hdr_b = (uint8_t *)malloc(1 + 10 + 10 + 2);
+            if (!hdr_b) goto no_b;
+            size_t w = 0;
+            if (new_len >= 1 && new_len <= 31) {
+                hdr_b[w++] = (uint8_t)(use_w ? 0xA0 : 0x20) | (uint8_t)new_len;
+            } else {
+                hdr_b[w++] = use_w ? 0xA0 : 0x20;
+                w += vi_enc((uint64_t)new_len, hdr_b + w);
+            }
+            if (use_w) {
+                le16_put(hdr_b + w, (uint16_t)(corresponding_old_offset / 4u));
+                w += 2;
+            } else {
+                w += vi_enc((uint64_t)corresponding_old_offset, hdr_b + w);
+            }
+            w += vi_enc((uint64_t)xdiff_enc_len, hdr_b + w);
+            hdr_b_len = w;
+            size_b = hdr_b_len + xdiff_enc_len;
         }
-        if (use_w) {
-            le16_put(hdr_b + w, (uint16_t)(corresponding_old_offset / 4u));
-            w += 2;
-        } else {
-            w += vi_enc((uint64_t)corresponding_old_offset, hdr_b + w);
-        }
-        w += vi_enc((uint64_t)xdiff_enc_len, hdr_b + w);
-        hdr_b_len = w;
-        size_b = hdr_b_len + xdiff_enc_len;
     }
 no_b:
+    free(tmp); tmp = NULL;
 
-    /* Pick smaller.  Break ties in favour of raw ADD (simpler decoder,
-     * same size anyway). */
-    int pick_b = try_b && size_b < size_a;
+    /* Pick smallest among A (raw ADD), B (ADDX xdiff), C (single XS),
+     * D (hybrid per-word XS + raw runs).  Ties → simplest decoder. */
+    int pick_d = try_d && size_d < size_a &&
+                 (size_b == (size_t)-1 || size_d < size_b) &&
+                 (size_c == (size_t)-1 || size_d < size_c);
+    int pick_c = !pick_d && try_c && size_c < size_a &&
+                 (size_b == (size_t)-1 || size_c < size_b);
+    int pick_b = !pick_d && !pick_c && try_b && size_b < size_a;
 
-    if (!pick_b) {
+    if (pick_d) {
+        /* Hybrid emit: walk 4B words. Use per-call `corresponding_old_offset`. */
+        size_t nwords = new_len / 4u;
+        size_t i = 0;
+        while (i < new_len) {
+            size_t w = i / 4u;
+            if (w < nwords && d_xs[w] && (i % 4 == 0)) {
+                /* Emit ADDX_XS for this word */
+                size_t base = w * 4u;
+                int bi = -1; uint8_t xv = 0;
+                /* recompute 1-nonzero-byte index and value (tmp already freed,
+                 * so re-compute via new_bytes ^ old_buf at this word offset). */
+                for (int z = 0; z < 4; ++z) {
+                    uint8_t xv2 = new_bytes[base+z] ^ old_buf[corresponding_old_offset + base + z];
+                    if (xv2) { bi = z; xv = xv2; }
+                }
+                if (bi >= 0) {
+                    uint8_t rec[4];
+                    rec[0] = (uint8_t)(0xC0u | (uint8_t)(bi & 3u));
+                    le16_put(rec + 1, (uint16_t)((corresponding_old_offset + base) / 4u));
+                    rec[3] = xv;
+                    if (ob_put(o, rec, 4)) { free(d_xs); goto oom; }
+                } else {
+                    /* d_xs marked but recompute missed; fall back to raw 4 bytes */
+                    uint8_t op = (4 <= 31) ? (uint8_t)(0x00 | 4) : 0x00;
+                    if (ob_u8(o, op)) { free(d_xs); goto oom; }
+                    if (op == 0x00) if (ob_vi(o, 4)) { free(d_xs); goto oom; }
+                    if (ob_put(o, new_bytes + base, 4)) { free(d_xs); goto oom; }
+                }
+                i += 4;
+            } else {
+                /* Raw ADD run of consecutive non-XS bytes */
+                size_t j = i;
+                while (j < new_len) {
+                    size_t wj = j / 4u;
+                    if (wj < nwords && (j % 4 == 0) && d_xs[wj]) break;
+                    j++;
+                }
+                size_t run = j - i;
+                if (run) {
+                    if (run <= 31) {
+                        if (ob_u8(o, (uint8_t)(0x00 | (uint8_t)run))) { free(d_xs); goto oom; }
+                    } else {
+                        if (ob_u8(o, 0x00)) { free(d_xs); goto oom; }
+                        if (ob_vi(o, (uint64_t)run)) { free(d_xs); goto oom; }
+                    }
+                    if (ob_put(o, new_bytes + i, run)) { free(d_xs); goto oom; }
+                }
+                i = j;
+            }
+        }
+        free(d_xs); d_xs = NULL;
+        free(hdr_b); free(xdiff_enc);
+        return 0;
+    }
+    free(d_xs); d_xs = NULL;
+
+    if (pick_c) {
+        uint8_t rec[4];
+        rec[0] = (uint8_t)(0xC0u | (uint8_t)(xs_biw & 3u));
+        le16_put(rec + 1, (uint16_t)(corresponding_old_offset / 4u));
+        rec[3] = xs_xor;
+        if (ob_put(o, rec, 4)) goto oom;
+        free(hdr_b); free(xdiff_enc);
+        return 0;
+    } else if (!pick_b) {
         if (ob_put(o, hdr_a, hdr_a_len)) goto oom;
         if (new_len && ob_put(o, new_bytes, new_len)) goto oom;
         free(hdr_b); free(xdiff_enc);
@@ -550,6 +714,7 @@ no_b:
         return 0;
     }
 oom:
+    free(d_xs);
     free(hdr_b); free(xdiff_enc);
     return -1;
 }
@@ -968,7 +1133,29 @@ static int decode_records(const uint8_t *rec, const uint8_t *rec_end,
             continue;
         }
 
-        /* unknown opcode (0x00, 0x80..0xFE, 0xFF, etc.): fail */
+        if (op >= 0xC0 && op <= 0xCF) {
+            /* ADDX_XS: 4-byte record → 4 bytes produced
+             * op[1:0]=byte_in_word(0..3); then u16le(woff); then 1B xor_byte */
+            uint8_t bi = (uint8_t)(op & 3u);
+            if ((size_t)(rec_end - p) < 3) return -1;
+            uint64_t off = (uint64_t)le16_get(p) * 4u; p += 2;
+            uint8_t xb = *p++;
+            uint64_t len = 4;
+            if (len > nsize - produced) return -1;
+            if (off > (uint64_t)old_size ||
+                off > (uint64_t)old_size - (size_t)len) return -1;
+            uint8_t row[4];
+            row[0] = old[(size_t)(off + 0)];
+            row[1] = old[(size_t)(off + 1)];
+            row[2] = old[(size_t)(off + 2)];
+            row[3] = old[(size_t)(off + 3)];
+            row[bi] ^= xb;
+            if (ob_put(out, row, 4)) return -2;
+            produced += 4;
+            continue;
+        }
+
+        /* unknown opcode (0xD0..0xFE, 0xFF, or other unhandled): fail */
         return -1;
     }
     if (produced != nsize) return -1;
