@@ -1,0 +1,540 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+
+<html lang="en">
+
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+  <title>LCOV - IntcController Driver Coverage Report - workspace/test_intc_driver.c</title>
+  <link rel="stylesheet" type="text/css" href="../gcov.css">
+</head>
+
+<body>
+
+          <table width="100%" border=0 cellspacing=0 cellpadding=0>
+            <tr><td class="title">LCOV - code coverage report</td></tr>
+            <tr><td class="ruler"><img src="../glass.png" width=3 height=3 alt=""></td></tr>
+
+            <tr>
+              <td width="100%">
+                <table cellpadding=1 border=0 width="100%">
+          <tr>
+            <td width="10%" class="headerItem">Current view:</td>
+            <td width="10%" class="headerValue"><a href="../index.html" target="_parent">top level</a> - <a href="index.html" target="_parent">/workspace</a> - test_intc_driver.c<span style="font-size: 80%;"> (source / <a href="test_intc_driver.c.func-c.html">functions</a>)</span></td>
+            <td width="5%"></td>
+            <td width="5%"></td>
+            <td width="5%" class="headerCovTableHead">Coverage</td>
+            <td width="5%" class="headerCovTableHead" title="Covered + Uncovered code">Total</td>
+            <td width="5%" class="headerCovTableHead" title="Exercised code only">Hit</td>
+          </tr>
+          <tr>
+            <td class="headerItem">Test:</td>
+            <td class="headerValue">IntcController Driver Coverage Report</td>
+            <td></td>
+            <td class="headerItem">Lines:</td>
+            <td class="headerCovTableEntryHi">100.0&nbsp;%</td>
+            <td class="headerCovTableEntry">250</td>
+            <td class="headerCovTableEntry">250</td>
+          </tr>
+          <tr>
+            <td class="headerItem">Test Date:</td>
+            <td class="headerValue">2026-08-27 12:03:11</td>
+            <td></td>
+            <td class="headerItem">Functions:</td>
+            <td class="headerCovTableEntryHi">100.0&nbsp;%</td>
+            <td class="headerCovTableEntry">21</td>
+            <td class="headerCovTableEntry">21</td>
+          </tr>
+          <tr>
+            <td class="headerItem">Legend:</td>
+            <td class="headerValueLeg">            Lines:
+            <span class="coverLegendCov">hit</span>
+            <span class="coverLegendNoCov">not hit</span>
+            | Branches:
+            <span class="coverLegendCov">+</span> taken
+            <span class="coverLegendNoCov">-</span> not taken
+            <span class="coverLegendNoCov">#</span> not executed
+</td>
+            <td></td>
+            <td class="headerItem">Branches:</td>
+            <td class="headerCovTableEntryLo">50.6&nbsp;%</td>
+            <td class="headerCovTableEntry">174</td>
+            <td class="headerCovTableEntry">88</td>
+          </tr>
+                  <tr><td><img src="../glass.png" width=3 height=3 alt=""></td></tr>
+                </table>
+              </td>
+            </tr>
+
+            <tr><td class="ruler"><img src="../glass.png" width=3 height=3 alt=""></td></tr>
+          </table>
+
+          <table cellpadding=0 cellspacing=0 border=0>
+            <tr>
+              <td><br></td>
+            </tr>
+            <tr>
+              <td>
+<pre class="sourceHeading">             Branch data     Line data    Source code</pre>
+<pre class="source">
+<span id="L1"><span class="lineNum">       1</span>                 :             : /**</span>
+<span id="L2"><span class="lineNum">       2</span>                 :             :  * @file    test_intc_driver.c</span>
+<span id="L3"><span class="lineNum">       3</span>                 :             :  * @brief   IntcController (AXI 中断控制器) 驱动单元测试</span>
+<span id="L4"><span class="lineNum">       4</span>                 :             :  *</span>
+<span id="L5"><span class="lineNum">       5</span>                 :             :  * 策略：</span>
+<span id="L6"><span class="lineNum">       6</span>                 :             :  *   1) sim 钩子模式 (g_read_fn/g_write_fn != NULL) —— 覆盖 hw_read/hw_write 的</span>
+<span id="L7"><span class="lineNum">       7</span>                 :             :  *      「钩子分支」与全部驱动逻辑（使能/屏蔽/触发/极性/ack/local socket 访问控制）；</span>
+<span id="L8"><span class="lineNum">       8</span>                 :             :  *   2) mirror 镜像模式 (钩子 NULL, g_mirror != NULL) —— 覆盖默认 I/O 的镜像分支；</span>
+<span id="L9"><span class="lineNum">       9</span>                 :             :  *   3) intc_driver_ut_probe_default_io(0/1) —— 覆盖 default_reg_index 的全部防御</span>
+<span id="L10"><span class="lineNum">      10</span>                 :             :  *      分支（低于基址/未对齐/越界/合法）与 default_reg_read/write 全部分支，</span>
+<span id="L11"><span class="lineNum">      11</span>                 :             :  *      mode=1 通过 mmap(MAP_FIXED) 把 INTC_BASE_ADDR 页映射到用户态，使</span>
+<span id="L12"><span class="lineNum">      12</span>                 :             :  *      `*(volatile uint32_t*)addr` 分支安全可达。</span>
+<span id="L13"><span class="lineNum">      13</span>                 :             :  */</span>
+<span id="L14"><span class="lineNum">      14</span>                 :             : #include &lt;stdio.h&gt;</span>
+<span id="L15"><span class="lineNum">      15</span>                 :             : #include &lt;stdlib.h&gt;</span>
+<span id="L16"><span class="lineNum">      16</span>                 :             : #include &lt;stdint.h&gt;</span>
+<span id="L17"><span class="lineNum">      17</span>                 :             : #include &lt;string.h&gt;</span>
+<span id="L18"><span class="lineNum">      18</span>                 :             : #include &quot;intc_driver.h&quot;</span>
+<span id="L19"><span class="lineNum">      19</span>                 :             : </span>
+<span id="L20"><span class="lineNum">      20</span>                 :             : #if defined(__unix__) || defined(__linux__)</span>
+<span id="L21"><span class="lineNum">      21</span>                 :             : #include &lt;sys/mman.h&gt;</span>
+<span id="L22"><span class="lineNum">      22</span>                 :             : #include &lt;unistd.h&gt;</span>
+<span id="L23"><span class="lineNum">      23</span>                 :             : #endif</span>
+<span id="L24"><span class="lineNum">      24</span>                 :             : </span>
+<span id="L25"><span class="lineNum">      25</span>                 :             : /* -------------------------------------------------------------------------</span>
+<span id="L26"><span class="lineNum">      26</span>                 :             :  *        用户态安全 MMIO 页管理（仅测试使用，用于覆盖 volatile 分支）</span>
+<span id="L27"><span class="lineNum">      27</span>                 :             :  * ------------------------------------------------------------------------- */</span>
+<span id="L28"><span class="lineNum">      28</span>                 :             : static void  *g_mmio_base = NULL;</span>
+<span id="L29"><span class="lineNum">      29</span>                 :             : static size_t g_page_size  = 0;</span>
+<span id="L30"><span class="lineNum">      30</span>                 :             : </span>
+<span id="L31"><span class="lineNum">      31</span>                 :<span class="tlaGNC tlaBgGNC">           1 : static int ut_map_mmio_page(void)</span></span>
+<span id="L32"><span class="lineNum">      32</span>                 :             : {</span>
+<span id="L33"><span class="lineNum">      33</span>                 :             : #if defined(__unix__) || defined(__linux__)</span>
+<span id="L34"><span class="lineNum">      34</span>                 :<span class="tlaGNC">           1 :     long ps = sysconf(_SC_PAGESIZE);</span></span>
+<span id="L35"><span class="lineNum">      35</span>         [<span class="tlaUNC" title="Branch 0 was not taken"> - </span><span class="tlaGBC" title="Branch 1 was taken 1 time"> + </span>]:<span class="tlaGNC">           1 :     if (ps &lt;= 0) return -1;</span></span>
+<span id="L36"><span class="lineNum">      36</span>                 :<span class="tlaGNC">           1 :     g_page_size = (size_t)ps;</span></span>
+<span id="L37"><span class="lineNum">      37</span>                 :             :     /* MAP_FIXED 把匿名页映射到 INTC_BASE_ADDR(0x40000000)，让驱动的</span>
+<span id="L38"><span class="lineNum">      38</span>                 :             :      * `*(volatile uint32_t*)0x40000000` 在用户态也能安全访问。 */</span>
+<span id="L39"><span class="lineNum">      39</span>                 :<span class="tlaGNC">           1 :     g_mmio_base = mmap((void *)(uintptr_t)INTC_BASE_ADDR,</span></span>
+<span id="L40"><span class="lineNum">      40</span>                 :             :                        g_page_size,</span>
+<span id="L41"><span class="lineNum">      41</span>                 :             :                        PROT_READ | PROT_WRITE,</span>
+<span id="L42"><span class="lineNum">      42</span>                 :             :                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,</span>
+<span id="L43"><span class="lineNum">      43</span>                 :             :                        -1, 0);</span>
+<span id="L44"><span class="lineNum">      44</span>         [<span class="tlaUNC" title="Branch 0 was not taken"> - </span><span class="tlaGBC" title="Branch 1 was taken 1 time"> + </span>]:<span class="tlaGNC">           1 :     if (g_mmio_base == MAP_FAILED) { g_mmio_base = NULL; return -1; }</span></span>
+<span id="L45"><span class="lineNum">      45</span>                 :<span class="tlaGNC">           1 :     memset(g_mmio_base, 0, g_page_size);</span></span>
+<span id="L46"><span class="lineNum">      46</span>                 :<span class="tlaGNC">           1 :     return 0;</span></span>
+<span id="L47"><span class="lineNum">      47</span>                 :             : #else</span>
+<span id="L48"><span class="lineNum">      48</span>                 :             :     return -1;</span>
+<span id="L49"><span class="lineNum">      49</span>                 :             : #endif</span>
+<span id="L50"><span class="lineNum">      50</span>                 :             : }</span>
+<span id="L51"><span class="lineNum">      51</span>                 :             : </span>
+<span id="L52"><span class="lineNum">      52</span>                 :<span class="tlaGNC">           1 : static void ut_unmap_mmio_page(void)</span></span>
+<span id="L53"><span class="lineNum">      53</span>                 :             : {</span>
+<span id="L54"><span class="lineNum">      54</span>                 :             : #if defined(__unix__) || defined(__linux__)</span>
+<span id="L55"><span class="lineNum">      55</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     if (g_mmio_base != NULL) {</span></span>
+<span id="L56"><span class="lineNum">      56</span>                 :<span class="tlaGNC">           1 :         munmap(g_mmio_base, g_page_size);</span></span>
+<span id="L57"><span class="lineNum">      57</span>                 :<span class="tlaGNC">           1 :         g_mmio_base = NULL;</span></span>
+<span id="L58"><span class="lineNum">      58</span>                 :             :     }</span>
+<span id="L59"><span class="lineNum">      59</span>                 :             : #else</span>
+<span id="L60"><span class="lineNum">      60</span>                 :             :     g_mmio_base = NULL;</span>
+<span id="L61"><span class="lineNum">      61</span>                 :             : #endif</span>
+<span id="L62"><span class="lineNum">      62</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L63"><span class="lineNum">      63</span>                 :             : </span>
+<span id="L64"><span class="lineNum">      64</span>                 :             : /* -------------------------------------------------------------------------</span>
+<span id="L65"><span class="lineNum">      65</span>                 :             :  *                           测试基础设施</span>
+<span id="L66"><span class="lineNum">      66</span>                 :             :  * ------------------------------------------------------------------------- */</span>
+<span id="L67"><span class="lineNum">      67</span>                 :             : static int g_pass_cnt = 0;</span>
+<span id="L68"><span class="lineNum">      68</span>                 :             : static int g_fail_cnt = 0;</span>
+<span id="L69"><span class="lineNum">      69</span>                 :             : </span>
+<span id="L70"><span class="lineNum">      70</span>                 :             : #define TEST_CASE(name) static void test_##name(void)</span>
+<span id="L71"><span class="lineNum">      71</span>                 :             : #define RUN_TEST(name)                                  \</span>
+<span id="L72"><span class="lineNum">      72</span>                 :             :     do {                                                \</span>
+<span id="L73"><span class="lineNum">      73</span>                 :             :         printf(&quot;  [RUN ] %s\n&quot;, #name);                 \</span>
+<span id="L74"><span class="lineNum">      74</span>                 :             :         test_##name();                                  \</span>
+<span id="L75"><span class="lineNum">      75</span>                 :             :     } while (0)</span>
+<span id="L76"><span class="lineNum">      76</span>                 :             : </span>
+<span id="L77"><span class="lineNum">      77</span>                 :             : #define ASSERT_TRUE(cond, fmt, ...)                                     \</span>
+<span id="L78"><span class="lineNum">      78</span>                 :             :     do {                                                                \</span>
+<span id="L79"><span class="lineNum">      79</span>                 :             :         if (cond) { g_pass_cnt++; }                                     \</span>
+<span id="L80"><span class="lineNum">      80</span>                 :             :         else {                                                          \</span>
+<span id="L81"><span class="lineNum">      81</span>                 :             :             g_fail_cnt++;                                               \</span>
+<span id="L82"><span class="lineNum">      82</span>                 :             :             printf(&quot;  [FAIL] %s:%d: &quot; fmt &quot;\n&quot;,                         \</span>
+<span id="L83"><span class="lineNum">      83</span>                 :             :                    __FILE__, __LINE__, ##__VA_ARGS__);                  \</span>
+<span id="L84"><span class="lineNum">      84</span>                 :             :         }                                                               \</span>
+<span id="L85"><span class="lineNum">      85</span>                 :             :     } while (0)</span>
+<span id="L86"><span class="lineNum">      86</span>                 :             : </span>
+<span id="L87"><span class="lineNum">      87</span>                 :             : #define ASSERT_EQ(actual, expected, fmt, ...)                           \</span>
+<span id="L88"><span class="lineNum">      88</span>                 :             :     ASSERT_TRUE((actual) == (expected),                                 \</span>
+<span id="L89"><span class="lineNum">      89</span>                 :             :                 &quot;expected=&quot; fmt &quot; actual=&quot; fmt, ##__VA_ARGS__,          \</span>
+<span id="L90"><span class="lineNum">      90</span>                 :             :                 (expected), (actual))</span>
+<span id="L91"><span class="lineNum">      91</span>                 :             : </span>
+<span id="L92"><span class="lineNum">      92</span>                 :             : /* -------------------------------------------------------------------------</span>
+<span id="L93"><span class="lineNum">      93</span>                 :             :  *                  模拟寄存器层：注入钩子模式</span>
+<span id="L94"><span class="lineNum">      94</span>                 :             :  * ------------------------------------------------------------------------- */</span>
+<span id="L95"><span class="lineNum">      95</span>                 :             : static uint32_t g_sim_regs[INTC_NUM_REGS];</span>
+<span id="L96"><span class="lineNum">      96</span>                 :             : static uint32_t g_sim_ro_writes;   /* 统计 sim 层尝试写 RO 寄存器的次数 */</span>
+<span id="L97"><span class="lineNum">      97</span>                 :             : </span>
+<span id="L98"><span class="lineNum">      98</span>                 :<span class="tlaGNC">         148 : static inline int sim_idx(uint32_t addr)</span></span>
+<span id="L99"><span class="lineNum">      99</span>                 :             : {</span>
+<span id="L100"><span class="lineNum">     100</span>         [<span class="tlaUNC" title="Branch 0 was not taken"> - </span><span class="tlaGBC" title="Branch 1 was taken 148 times"> + </span>]:<span class="tlaGNC">         148 :     if (addr &lt; INTC_BASE_ADDR) return -1;</span></span>
+<span id="L101"><span class="lineNum">     101</span>                 :<span class="tlaGNC">         148 :     uint32_t off = (uint32_t)(addr - INTC_BASE_ADDR);</span></span>
+<span id="L102"><span class="lineNum">     102</span>         [<span class="tlaUNC" title="Branch 0 was not taken"> - </span><span class="tlaGBC" title="Branch 1 was taken 148 times"> + </span>]:<span class="tlaGNC">         148 :     if ((off &amp; 0x3u) != 0u) return -1;</span></span>
+<span id="L103"><span class="lineNum">     103</span>                 :<span class="tlaGNC">         148 :     int idx = (int)(off &gt;&gt; 2);</span></span>
+<span id="L104"><span class="lineNum">     104</span>         [<span class="tlaUNC" title="Branch 0 was not taken"> - </span><span class="tlaGBC" title="Branch 1 was taken 148 times"> + </span>]:<span class="tlaGNC">         148 :     if (idx &gt;= (int)INTC_NUM_REGS) return -1;</span></span>
+<span id="L105"><span class="lineNum">     105</span>                 :<span class="tlaGNC">         148 :     return idx;</span></span>
+<span id="L106"><span class="lineNum">     106</span>                 :             : }</span>
+<span id="L107"><span class="lineNum">     107</span>                 :             : </span>
+<span id="L108"><span class="lineNum">     108</span>                 :             : static const int sim_writable[INTC_NUM_REGS] = { 1, 1, 1, 0, 0, 1, 1, 1, 1, 0 };</span>
+<span id="L109"><span class="lineNum">     109</span>                 :             : </span>
+<span id="L110"><span class="lineNum">     110</span>                 :<span class="tlaGNC">         106 : static uint32_t sim_reg_read(uint32_t addr)</span></span>
+<span id="L111"><span class="lineNum">     111</span>                 :             : {</span>
+<span id="L112"><span class="lineNum">     112</span>                 :<span class="tlaGNC">         106 :     int idx = sim_idx(addr);</span></span>
+<span id="L113"><span class="lineNum">     113</span>         [<span class="tlaUNC" title="Branch 0 was not taken"> - </span><span class="tlaGBC" title="Branch 1 was taken 106 times"> + </span>]:<span class="tlaGNC">         106 :     if (idx &lt; 0) return 0xFFFFFFFFu;</span></span>
+<span id="L114"><span class="lineNum">     114</span>                 :<span class="tlaGNC">         106 :     return g_sim_regs[idx];</span></span>
+<span id="L115"><span class="lineNum">     115</span>                 :             : }</span>
+<span id="L116"><span class="lineNum">     116</span>                 :             : </span>
+<span id="L117"><span class="lineNum">     117</span>                 :<span class="tlaGNC">          42 : static void sim_reg_write(uint32_t addr, uint32_t value)</span></span>
+<span id="L118"><span class="lineNum">     118</span>                 :             : {</span>
+<span id="L119"><span class="lineNum">     119</span>                 :<span class="tlaGNC">          42 :     int idx = sim_idx(addr);</span></span>
+<span id="L120"><span class="lineNum">     120</span>         [<span class="tlaUNC" title="Branch 0 was not taken"> - </span><span class="tlaGBC" title="Branch 1 was taken 42 times"> + </span>]:<span class="tlaGNC">          42 :     if (idx &lt; 0) return;</span></span>
+<span id="L121"><span class="lineNum">     121</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaGBC" title="Branch 1 was taken 41 times"> + </span>]:<span class="tlaGNC">          42 :     if (!sim_writable[idx]) { g_sim_ro_writes++; return; }</span></span>
+<span id="L122"><span class="lineNum">     122</span>                 :<span class="tlaGNC">          41 :     g_sim_regs[idx] = value;</span></span>
+<span id="L123"><span class="lineNum">     123</span>                 :             : }</span>
+<span id="L124"><span class="lineNum">     124</span>                 :             : </span>
+<span id="L125"><span class="lineNum">     125</span>                 :<span class="tlaGNC">          11 : static void sim_reset(void)</span></span>
+<span id="L126"><span class="lineNum">     126</span>                 :             : {</span>
+<span id="L127"><span class="lineNum">     127</span>                 :<span class="tlaGNC">          11 :     g_sim_regs[0] = INTC_CTRL_RESET_VALUE;</span></span>
+<span id="L128"><span class="lineNum">     128</span>                 :<span class="tlaGNC">          11 :     g_sim_regs[1] = IRQ_ENABLE_RESET_VALUE;</span></span>
+<span id="L129"><span class="lineNum">     129</span>                 :<span class="tlaGNC">          11 :     g_sim_regs[2] = IRQ_MASK_RESET_VALUE;</span></span>
+<span id="L130"><span class="lineNum">     130</span>                 :<span class="tlaGNC">          11 :     g_sim_regs[3] = IRQ_RAW_RESET_VALUE;</span></span>
+<span id="L131"><span class="lineNum">     131</span>                 :<span class="tlaGNC">          11 :     g_sim_regs[4] = IRQ_PENDING_RESET_VALUE;</span></span>
+<span id="L132"><span class="lineNum">     132</span>                 :<span class="tlaGNC">          11 :     g_sim_regs[5] = IRQ_ACK_RESET_VALUE;</span></span>
+<span id="L133"><span class="lineNum">     133</span>                 :<span class="tlaGNC">          11 :     g_sim_regs[6] = IRQ_TRIGGER_RESET_VALUE;</span></span>
+<span id="L134"><span class="lineNum">     134</span>                 :<span class="tlaGNC">          11 :     g_sim_regs[7] = IRQ_POLARITY_RESET_VALUE;</span></span>
+<span id="L135"><span class="lineNum">     135</span>                 :<span class="tlaGNC">          11 :     g_sim_regs[8] = SOCKET_ID_RESET_VALUE;</span></span>
+<span id="L136"><span class="lineNum">     136</span>                 :<span class="tlaGNC">          11 :     g_sim_regs[9] = SOCKET_STATUS_RESET_VALUE;</span></span>
+<span id="L137"><span class="lineNum">     137</span>                 :<span class="tlaGNC">          11 :     g_sim_ro_writes = 0;</span></span>
+<span id="L138"><span class="lineNum">     138</span>                 :<span class="tlaGNC">          11 :     intc_driver_register_io(sim_reg_read, sim_reg_write);</span></span>
+<span id="L139"><span class="lineNum">     139</span>                 :<span class="tlaGNC">          11 :     intc_driver_set_mmio_mirror(NULL);   /* 强制走钩子路径 */</span></span>
+<span id="L140"><span class="lineNum">     140</span>                 :<span class="tlaGNC">          11 :     intc_set_local_socket(0);</span></span>
+<span id="L141"><span class="lineNum">     141</span>                 :<span class="tlaGNC">          11 : }</span></span>
+<span id="L142"><span class="lineNum">     142</span>                 :             : </span>
+<span id="L143"><span class="lineNum">     143</span>                 :             : /* -------------------------------------------------------------------------</span>
+<span id="L144"><span class="lineNum">     144</span>                 :             :  *                  镜像寄存器层：默认 I/O 的镜像模式</span>
+<span id="L145"><span class="lineNum">     145</span>                 :             :  *                  （钩子为 NULL，覆盖 default_reg_read/write 的 mirror 分支）</span>
+<span id="L146"><span class="lineNum">     146</span>                 :             :  * ------------------------------------------------------------------------- */</span>
+<span id="L147"><span class="lineNum">     147</span>                 :             : static uint32_t g_mirror_regs[INTC_NUM_REGS];</span>
+<span id="L148"><span class="lineNum">     148</span>                 :             : </span>
+<span id="L149"><span class="lineNum">     149</span>                 :<span class="tlaGNC">           1 : static void mirror_reset(void)</span></span>
+<span id="L150"><span class="lineNum">     150</span>                 :             : {</span>
+<span id="L151"><span class="lineNum">     151</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[0] = INTC_CTRL_RESET_VALUE;</span></span>
+<span id="L152"><span class="lineNum">     152</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[1] = IRQ_ENABLE_RESET_VALUE;</span></span>
+<span id="L153"><span class="lineNum">     153</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[2] = IRQ_MASK_RESET_VALUE;</span></span>
+<span id="L154"><span class="lineNum">     154</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[3] = IRQ_RAW_RESET_VALUE;</span></span>
+<span id="L155"><span class="lineNum">     155</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[4] = IRQ_PENDING_RESET_VALUE;</span></span>
+<span id="L156"><span class="lineNum">     156</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[5] = IRQ_ACK_RESET_VALUE;</span></span>
+<span id="L157"><span class="lineNum">     157</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[6] = IRQ_TRIGGER_RESET_VALUE;</span></span>
+<span id="L158"><span class="lineNum">     158</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[7] = IRQ_POLARITY_RESET_VALUE;</span></span>
+<span id="L159"><span class="lineNum">     159</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[8] = SOCKET_ID_RESET_VALUE;</span></span>
+<span id="L160"><span class="lineNum">     160</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[9] = SOCKET_STATUS_RESET_VALUE;</span></span>
+<span id="L161"><span class="lineNum">     161</span>                 :<span class="tlaGNC">           1 :     intc_driver_register_io(NULL, NULL);   /* 不注入钩子 → 走默认 I/O */</span></span>
+<span id="L162"><span class="lineNum">     162</span>                 :<span class="tlaGNC">           1 :     intc_driver_set_mmio_mirror(g_mirror_regs);</span></span>
+<span id="L163"><span class="lineNum">     163</span>                 :<span class="tlaGNC">           1 :     intc_set_local_socket(0);</span></span>
+<span id="L164"><span class="lineNum">     164</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L165"><span class="lineNum">     165</span>                 :             : </span>
+<span id="L166"><span class="lineNum">     166</span>                 :             : /* -------------------------------------------------------------------------</span>
+<span id="L167"><span class="lineNum">     167</span>                 :             :  *                            测试用例</span>
+<span id="L168"><span class="lineNum">     168</span>                 :             :  * ------------------------------------------------------------------------- */</span>
+<span id="L169"><span class="lineNum">     169</span>                 :             : </span>
+<span id="L170"><span class="lineNum">     170</span>                 :             : /* 1. 初始化与复位值 */</span>
+<span id="L171"><span class="lineNum">     171</span>                 :<span class="tlaGNC">           1 : TEST_CASE(init_reset_values)</span></span>
+<span id="L172"><span class="lineNum">     172</span>                 :             : {</span>
+<span id="L173"><span class="lineNum">     173</span>                 :<span class="tlaGNC">           1 :     sim_reset();</span></span>
+<span id="L174"><span class="lineNum">     174</span>                 :<span class="tlaGNC">           1 :     intc_driver_init();   /* 写所有 RW 寄存器到复位值（RO 写被 sim 忽略） */</span></span>
+<span id="L175"><span class="lineNum">     175</span>                 :             : </span>
+<span id="L176"><span class="lineNum">     176</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_enable(),    IRQ_ENABLE_RESET_VALUE,    &quot;0x%08X&quot;);</span></span>
+<span id="L177"><span class="lineNum">     177</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_mask(),      IRQ_MASK_RESET_VALUE,      &quot;0x%08X&quot;);</span></span>
+<span id="L178"><span class="lineNum">     178</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_trigger(),   IRQ_TRIGGER_RESET_VALUE,   &quot;0x%08X&quot;);</span></span>
+<span id="L179"><span class="lineNum">     179</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_polarity(),  IRQ_POLARITY_RESET_VALUE,  &quot;0x%08X&quot;);</span></span>
+<span id="L180"><span class="lineNum">     180</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_raw(),       IRQ_RAW_RESET_VALUE,       &quot;0x%08X&quot;);</span></span>
+<span id="L181"><span class="lineNum">     181</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_pending(),   IRQ_PENDING_RESET_VALUE,   &quot;0x%08X&quot;);</span></span>
+<span id="L182"><span class="lineNum">     182</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_get_socket_status(), SOCKET_STATUS_RESET_VALUE, &quot;0x%08X&quot;);</span></span>
+<span id="L183"><span class="lineNum">     183</span>                 :             : </span>
+<span id="L184"><span class="lineNum">     184</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_is_global_enabled(),       0U, &quot;%u&quot;);  /* ternary F */</span></span>
+<span id="L185"><span class="lineNum">     185</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_is_local_access_enabled(), 0U, &quot;%u&quot;);  /* ternary F */</span></span>
+<span id="L186"><span class="lineNum">     186</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_check_access(), 1, &quot;%d&quot;);              /* LOCAL_EN=0 → open (first if T) */</span></span>
+<span id="L187"><span class="lineNum">     187</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_get_access_state(), INTC_ACCESS_OPEN, &quot;%d&quot;);</span></span>
+<span id="L188"><span class="lineNum">     188</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L189"><span class="lineNum">     189</span>                 :             : </span>
+<span id="L190"><span class="lineNum">     190</span>                 :             : /* 2. 全局使能/关闭：含 early-return 两分支 */</span>
+<span id="L191"><span class="lineNum">     191</span>                 :<span class="tlaGNC">           1 : TEST_CASE(global_enable_disable)</span></span>
+<span id="L192"><span class="lineNum">     192</span>                 :             : {</span>
+<span id="L193"><span class="lineNum">     193</span>                 :<span class="tlaGNC">           1 :     sim_reset();</span></span>
+<span id="L194"><span class="lineNum">     194</span>                 :             : </span>
+<span id="L195"><span class="lineNum">     195</span>                 :<span class="tlaGNC">           1 :     intc_global_enable();                                  /* F: proceed */</span></span>
+<span id="L196"><span class="lineNum">     196</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_is_global_enabled(), 1U, &quot;%u&quot;);         /* ternary T */</span></span>
+<span id="L197"><span class="lineNum">     197</span>                 :<span class="tlaGNC">           1 :     intc_global_enable();                                  /* T: already enabled */</span></span>
+<span id="L198"><span class="lineNum">     198</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(g_sim_regs[0] &amp; INTC_CTRL_GLOBAL_EN_Msk, INTC_CTRL_GLOBAL_EN_Msk, &quot;0x%08X&quot;);</span></span>
+<span id="L199"><span class="lineNum">     199</span>                 :             : </span>
+<span id="L200"><span class="lineNum">     200</span>                 :<span class="tlaGNC">           1 :     intc_global_disable();                                 /* F: proceed */</span></span>
+<span id="L201"><span class="lineNum">     201</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_is_global_enabled(), 0U, &quot;%u&quot;);         /* ternary F */</span></span>
+<span id="L202"><span class="lineNum">     202</span>                 :<span class="tlaGNC">           1 :     intc_global_disable();                                 /* T: already disabled */</span></span>
+<span id="L203"><span class="lineNum">     203</span>                 :             : </span>
+<span id="L204"><span class="lineNum">     204</span>                 :             :     /* RMW 不破坏其他位 */</span>
+<span id="L205"><span class="lineNum">     205</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[0] = INTC_CTRL_SOFT_RESET_Msk;</span></span>
+<span id="L206"><span class="lineNum">     206</span>                 :<span class="tlaGNC">           1 :     intc_global_enable();</span></span>
+<span id="L207"><span class="lineNum">     207</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_TRUE((g_sim_regs[0] &amp; INTC_CTRL_SOFT_RESET_Msk) != 0u,</span></span>
+<span id="L208"><span class="lineNum">     208</span>                 :             :                 &quot;enable RMW 破坏 SOFT_RESET, ctrl=0x%08X&quot;, g_sim_regs[0]);</span>
+<span id="L209"><span class="lineNum">     209</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_is_global_enabled(), 1U, &quot;%u&quot;);</span></span>
+<span id="L210"><span class="lineNum">     210</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L211"><span class="lineNum">     211</span>                 :             : </span>
+<span id="L212"><span class="lineNum">     212</span>                 :             : /* 3. 软件复位：含 early-return 两分支 */</span>
+<span id="L213"><span class="lineNum">     213</span>                 :<span class="tlaGNC">           1 : TEST_CASE(soft_reset)</span></span>
+<span id="L214"><span class="lineNum">     214</span>                 :             : {</span>
+<span id="L215"><span class="lineNum">     215</span>                 :<span class="tlaGNC">           1 :     sim_reset();</span></span>
+<span id="L216"><span class="lineNum">     216</span>                 :<span class="tlaGNC">           1 :     intc_global_enable();</span></span>
+<span id="L217"><span class="lineNum">     217</span>                 :<span class="tlaGNC">           1 :     uint32_t before = g_sim_regs[0];</span></span>
+<span id="L218"><span class="lineNum">     218</span>                 :             : </span>
+<span id="L219"><span class="lineNum">     219</span>                 :<span class="tlaGNC">           1 :     intc_soft_reset();                                     /* F: proceed */</span></span>
+<span id="L220"><span class="lineNum">     220</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(g_sim_regs[0], before | INTC_CTRL_SOFT_RESET_Msk, &quot;0x%08X&quot;);</span></span>
+<span id="L221"><span class="lineNum">     221</span>                 :<span class="tlaGNC">           1 :     intc_soft_reset();                                     /* T: already in reset */</span></span>
+<span id="L222"><span class="lineNum">     222</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(g_sim_regs[0], before | INTC_CTRL_SOFT_RESET_Msk, &quot;0x%08X&quot;);</span></span>
+<span id="L223"><span class="lineNum">     223</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_is_global_enabled(), 1U, &quot;%u&quot;);</span></span>
+<span id="L224"><span class="lineNum">     224</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L225"><span class="lineNum">     225</span>                 :             : </span>
+<span id="L226"><span class="lineNum">     226</span>                 :             : /* 4. local socket 访问使能/关闭：含 early-return 两分支 */</span>
+<span id="L227"><span class="lineNum">     227</span>                 :<span class="tlaGNC">           1 : TEST_CASE(local_access_enable_disable)</span></span>
+<span id="L228"><span class="lineNum">     228</span>                 :             : {</span>
+<span id="L229"><span class="lineNum">     229</span>                 :<span class="tlaGNC">           1 :     sim_reset();</span></span>
+<span id="L230"><span class="lineNum">     230</span>                 :             : </span>
+<span id="L231"><span class="lineNum">     231</span>                 :<span class="tlaGNC">           1 :     intc_local_access_enable();                            /* F: proceed */</span></span>
+<span id="L232"><span class="lineNum">     232</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_is_local_access_enabled(), 1U, &quot;%u&quot;);   /* ternary T */</span></span>
+<span id="L233"><span class="lineNum">     233</span>                 :<span class="tlaGNC">           1 :     intc_local_access_enable();                            /* T: already enabled */</span></span>
+<span id="L234"><span class="lineNum">     234</span>                 :             : </span>
+<span id="L235"><span class="lineNum">     235</span>                 :<span class="tlaGNC">           1 :     intc_local_access_disable();                           /* F: proceed */</span></span>
+<span id="L236"><span class="lineNum">     236</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_is_local_access_enabled(), 0U, &quot;%u&quot;);   /* ternary F */</span></span>
+<span id="L237"><span class="lineNum">     237</span>                 :<span class="tlaGNC">           1 :     intc_local_access_disable();                           /* T: already disabled */</span></span>
+<span id="L238"><span class="lineNum">     238</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L239"><span class="lineNum">     239</span>                 :             : </span>
+<span id="L240"><span class="lineNum">     240</span>                 :             : /* 5. intc_check_access / intc_get_access_state 全部分支 */</span>
+<span id="L241"><span class="lineNum">     241</span>                 :<span class="tlaGNC">           1 : TEST_CASE(check_access_and_state)</span></span>
+<span id="L242"><span class="lineNum">     242</span>                 :             : {</span>
+<span id="L243"><span class="lineNum">     243</span>                 :<span class="tlaGNC">           1 :     sim_reset();</span></span>
+<span id="L244"><span class="lineNum">     244</span>                 :             :     /* OPEN: LOCAL_EN=0 (first if T) */</span>
+<span id="L245"><span class="lineNum">     245</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_check_access(), 1, &quot;%d&quot;);</span></span>
+<span id="L246"><span class="lineNum">     246</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_get_access_state(), INTC_ACCESS_OPEN, &quot;%d&quot;);</span></span>
+<span id="L247"><span class="lineNum">     247</span>                 :             : </span>
+<span id="L248"><span class="lineNum">     248</span>                 :             :     /* OWNER: LOCAL_EN=1, current == owner (first if F, ternary/second if T) */</span>
+<span id="L249"><span class="lineNum">     249</span>                 :<span class="tlaGNC">           1 :     intc_set_local_socket(5);</span></span>
+<span id="L250"><span class="lineNum">     250</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[8] = 5u;</span></span>
+<span id="L251"><span class="lineNum">     251</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[0] |= INTC_CTRL_LOCAL_EN_Msk;</span></span>
+<span id="L252"><span class="lineNum">     252</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_check_access(), 1, &quot;%d&quot;);</span></span>
+<span id="L253"><span class="lineNum">     253</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_get_access_state(), INTC_ACCESS_OWNER, &quot;%d&quot;);</span></span>
+<span id="L254"><span class="lineNum">     254</span>                 :             : </span>
+<span id="L255"><span class="lineNum">     255</span>                 :             :     /* DENIED: LOCAL_EN=1, current != owner (first if F, ternary/second if F) */</span>
+<span id="L256"><span class="lineNum">     256</span>                 :<span class="tlaGNC">           1 :     intc_set_local_socket(3);</span></span>
+<span id="L257"><span class="lineNum">     257</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_check_access(), 0, &quot;%d&quot;);</span></span>
+<span id="L258"><span class="lineNum">     258</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_get_access_state(), INTC_ACCESS_DENIED, &quot;%d&quot;);</span></span>
+<span id="L259"><span class="lineNum">     259</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L260"><span class="lineNum">     260</span>                 :             : </span>
+<span id="L261"><span class="lineNum">     261</span>                 :             : /* 6. intc_claim_socket 全部分支 */</span>
+<span id="L262"><span class="lineNum">     262</span>                 :<span class="tlaGNC">           1 : TEST_CASE(claim_socket)</span></span>
+<span id="L263"><span class="lineNum">     263</span>                 :             : {</span>
+<span id="L264"><span class="lineNum">     264</span>                 :<span class="tlaGNC">           1 :     sim_reset();</span></span>
+<span id="L265"><span class="lineNum">     265</span>                 :<span class="tlaGNC">           1 :     intc_set_local_socket(7);</span></span>
+<span id="L266"><span class="lineNum">     266</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_get_local_socket(), 7u, &quot;%u&quot;);   /* 覆盖 intc_get_local_socket */</span></span>
+<span id="L267"><span class="lineNum">     267</span>                 :             : </span>
+<span id="L268"><span class="lineNum">     268</span>                 :             :     /* LOCAL_EN=0 → 直接写, return 0 (first if F) */</span>
+<span id="L269"><span class="lineNum">     269</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_claim_socket(7), 0, &quot;%d&quot;);</span></span>
+<span id="L270"><span class="lineNum">     270</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(g_sim_regs[8] &amp; SOCKET_ID_ID_Msk, 7u, &quot;%u&quot;);</span></span>
+<span id="L271"><span class="lineNum">     271</span>                 :             : </span>
+<span id="L272"><span class="lineNum">     272</span>                 :             :     /* LOCAL_EN=1, current != owner → return -1 (first if T, inner if T) */</span>
+<span id="L273"><span class="lineNum">     273</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[0] |= INTC_CTRL_LOCAL_EN_Msk;</span></span>
+<span id="L274"><span class="lineNum">     274</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[8] = 7u;            /* owner = 7 */</span></span>
+<span id="L275"><span class="lineNum">     275</span>                 :<span class="tlaGNC">           1 :     intc_set_local_socket(3);       /* current = 3 != 7 */</span></span>
+<span id="L276"><span class="lineNum">     276</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_claim_socket(9), -1, &quot;%d&quot;);</span></span>
+<span id="L277"><span class="lineNum">     277</span>                 :             : </span>
+<span id="L278"><span class="lineNum">     278</span>                 :             :     /* LOCAL_EN=1, current == owner → 写, return 0 (first if T, inner if F) */</span>
+<span id="L279"><span class="lineNum">     279</span>                 :<span class="tlaGNC">           1 :     intc_set_local_socket(7);       /* current = 7 == owner */</span></span>
+<span id="L280"><span class="lineNum">     280</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_claim_socket(9), 0, &quot;%d&quot;);</span></span>
+<span id="L281"><span class="lineNum">     281</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(g_sim_regs[8] &amp; SOCKET_ID_ID_Msk, 9u, &quot;%u&quot;);</span></span>
+<span id="L282"><span class="lineNum">     282</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L283"><span class="lineNum">     283</span>                 :             : </span>
+<span id="L284"><span class="lineNum">     284</span>                 :             : /* 7. IRQ 使能/关闭：含访问被拒 (T) 与放行 (F) 两分支 */</span>
+<span id="L285"><span class="lineNum">     285</span>                 :<span class="tlaGNC">           1 : TEST_CASE(irq_enable_disable_access)</span></span>
+<span id="L286"><span class="lineNum">     286</span>                 :             : {</span>
+<span id="L287"><span class="lineNum">     287</span>                 :<span class="tlaGNC">           1 :     sim_reset();</span></span>
+<span id="L288"><span class="lineNum">     288</span>                 :             : </span>
+<span id="L289"><span class="lineNum">     289</span>                 :             :     /* open access → proceed, return 0 (if !check F) */</span>
+<span id="L290"><span class="lineNum">     290</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_enable(0x1u), 0, &quot;%d&quot;);</span></span>
+<span id="L291"><span class="lineNum">     291</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_enable(), 0x1u, &quot;0x%08X&quot;);</span></span>
+<span id="L292"><span class="lineNum">     292</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_disable(0x1u), 0, &quot;%d&quot;);</span></span>
+<span id="L293"><span class="lineNum">     293</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_enable(), 0x0u, &quot;0x%08X&quot;);</span></span>
+<span id="L294"><span class="lineNum">     294</span>                 :             : </span>
+<span id="L295"><span class="lineNum">     295</span>                 :             :     /* denied → return -1 (if !check T) */</span>
+<span id="L296"><span class="lineNum">     296</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[0] |= INTC_CTRL_LOCAL_EN_Msk;</span></span>
+<span id="L297"><span class="lineNum">     297</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[8] = 5u;</span></span>
+<span id="L298"><span class="lineNum">     298</span>                 :<span class="tlaGNC">           1 :     intc_set_local_socket(1);      /* current = 1 != owner 5 */</span></span>
+<span id="L299"><span class="lineNum">     299</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_enable(0x2u), -1, &quot;%d&quot;);</span></span>
+<span id="L300"><span class="lineNum">     300</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_disable(0x2u), -1, &quot;%d&quot;);</span></span>
+<span id="L301"><span class="lineNum">     301</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_enable(), 0x0u, &quot;0x%08X&quot;);</span></span>
+<span id="L302"><span class="lineNum">     302</span>                 :             : </span>
+<span id="L303"><span class="lineNum">     303</span>                 :             :     /* owner → proceed (if !check F) */</span>
+<span id="L304"><span class="lineNum">     304</span>                 :<span class="tlaGNC">           1 :     intc_set_local_socket(5);</span></span>
+<span id="L305"><span class="lineNum">     305</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_enable(0x4u), 0, &quot;%d&quot;);</span></span>
+<span id="L306"><span class="lineNum">     306</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_enable(), 0x4u, &quot;0x%08X&quot;);</span></span>
+<span id="L307"><span class="lineNum">     307</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_disable(0x4u), 0, &quot;%d&quot;);</span></span>
+<span id="L308"><span class="lineNum">     308</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L309"><span class="lineNum">     309</span>                 :             : </span>
+<span id="L310"><span class="lineNum">     310</span>                 :             : /* 8. IRQ 屏蔽/解除屏蔽：含访问被拒 (T) 与放行 (F) 两分支 */</span>
+<span id="L311"><span class="lineNum">     311</span>                 :<span class="tlaGNC">           1 : TEST_CASE(irq_mask_unmask_access)</span></span>
+<span id="L312"><span class="lineNum">     312</span>                 :             : {</span>
+<span id="L313"><span class="lineNum">     313</span>                 :<span class="tlaGNC">           1 :     sim_reset();</span></span>
+<span id="L314"><span class="lineNum">     314</span>                 :             : </span>
+<span id="L315"><span class="lineNum">     315</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_unmask(0x1u), 0, &quot;%d&quot;);</span></span>
+<span id="L316"><span class="lineNum">     316</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_mask(), 0xFFFFFFFEu, &quot;0x%08X&quot;);</span></span>
+<span id="L317"><span class="lineNum">     317</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_mask(0x1u), 0, &quot;%d&quot;);</span></span>
+<span id="L318"><span class="lineNum">     318</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_mask(), 0xFFFFFFFFu, &quot;0x%08X&quot;);</span></span>
+<span id="L319"><span class="lineNum">     319</span>                 :             : </span>
+<span id="L320"><span class="lineNum">     320</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[0] |= INTC_CTRL_LOCAL_EN_Msk;</span></span>
+<span id="L321"><span class="lineNum">     321</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[8] = 5u;</span></span>
+<span id="L322"><span class="lineNum">     322</span>                 :<span class="tlaGNC">           1 :     intc_set_local_socket(2);</span></span>
+<span id="L323"><span class="lineNum">     323</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_mask(0x2u), -1, &quot;%d&quot;);</span></span>
+<span id="L324"><span class="lineNum">     324</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_unmask(0x2u), -1, &quot;%d&quot;);</span></span>
+<span id="L325"><span class="lineNum">     325</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_mask(), 0xFFFFFFFFu, &quot;0x%08X&quot;);</span></span>
+<span id="L326"><span class="lineNum">     326</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L327"><span class="lineNum">     327</span>                 :             : </span>
+<span id="L328"><span class="lineNum">     328</span>                 :             : /* 9. 触发类型/极性：trig==EDGE(T)/LEVEL(F)、pol==HIGH(T)/LOW(F) + 访问两分支 */</span>
+<span id="L329"><span class="lineNum">     329</span>                 :<span class="tlaGNC">           1 : TEST_CASE(irq_trigger_polarity)</span></span>
+<span id="L330"><span class="lineNum">     330</span>                 :             : {</span>
+<span id="L331"><span class="lineNum">     331</span>                 :<span class="tlaGNC">           1 :     sim_reset();</span></span>
+<span id="L332"><span class="lineNum">     332</span>                 :             : </span>
+<span id="L333"><span class="lineNum">     333</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_set_trigger(0x3u, INTC_TRIG_EDGE), 0, &quot;%d&quot;);   /* trig T */</span></span>
+<span id="L334"><span class="lineNum">     334</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_trigger(), 0x3u, &quot;0x%08X&quot;);</span></span>
+<span id="L335"><span class="lineNum">     335</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_set_trigger(0x3u, INTC_TRIG_LEVEL), 0, &quot;%d&quot;);  /* trig F */</span></span>
+<span id="L336"><span class="lineNum">     336</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_trigger(), 0x0u, &quot;0x%08X&quot;);</span></span>
+<span id="L337"><span class="lineNum">     337</span>                 :<span class="tlaGNC">           1 :     intc_irq_set_trigger(0x1u, INTC_TRIG_EDGE);   /* bit0 edge */</span></span>
+<span id="L338"><span class="lineNum">     338</span>                 :<span class="tlaGNC">           1 :     intc_irq_set_trigger(0x2u, INTC_TRIG_LEVEL);  /* bit1 level */</span></span>
+<span id="L339"><span class="lineNum">     339</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_trigger(), 0x1u, &quot;0x%08X&quot;);</span></span>
+<span id="L340"><span class="lineNum">     340</span>                 :             : </span>
+<span id="L341"><span class="lineNum">     341</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_set_polarity(0x1u, INTC_POL_LOW), 0, &quot;%d&quot;);   /* pol F → clear */</span></span>
+<span id="L342"><span class="lineNum">     342</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_polarity(), 0xFFFFFFFEu, &quot;0x%08X&quot;);</span></span>
+<span id="L343"><span class="lineNum">     343</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_set_polarity(0x1u, INTC_POL_HIGH), 0, &quot;%d&quot;);  /* pol T → set */</span></span>
+<span id="L344"><span class="lineNum">     344</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_polarity(), 0xFFFFFFFFu, &quot;0x%08X&quot;);</span></span>
+<span id="L345"><span class="lineNum">     345</span>                 :             : </span>
+<span id="L346"><span class="lineNum">     346</span>                 :             :     /* denied: trig/polarity 两 API 的 if !check T 分支 */</span>
+<span id="L347"><span class="lineNum">     347</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[0] |= INTC_CTRL_LOCAL_EN_Msk;</span></span>
+<span id="L348"><span class="lineNum">     348</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[8] = 5u;</span></span>
+<span id="L349"><span class="lineNum">     349</span>                 :<span class="tlaGNC">           1 :     intc_set_local_socket(9);</span></span>
+<span id="L350"><span class="lineNum">     350</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_set_trigger(0x1u, INTC_TRIG_EDGE), -1, &quot;%d&quot;);</span></span>
+<span id="L351"><span class="lineNum">     351</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_set_polarity(0x1u, INTC_POL_HIGH), -1, &quot;%d&quot;);</span></span>
+<span id="L352"><span class="lineNum">     352</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L353"><span class="lineNum">     353</span>                 :             : </span>
+<span id="L354"><span class="lineNum">     354</span>                 :             : /* 10. IRQ ack：访问两分支 */</span>
+<span id="L355"><span class="lineNum">     355</span>                 :<span class="tlaGNC">           1 : TEST_CASE(irq_ack_access)</span></span>
+<span id="L356"><span class="lineNum">     356</span>                 :             : {</span>
+<span id="L357"><span class="lineNum">     357</span>                 :<span class="tlaGNC">           1 :     sim_reset();</span></span>
+<span id="L358"><span class="lineNum">     358</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_ack(0x5u), 0, &quot;%d&quot;);</span></span>
+<span id="L359"><span class="lineNum">     359</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(g_sim_regs[5], 0x5u, &quot;0x%08X&quot;);</span></span>
+<span id="L360"><span class="lineNum">     360</span>                 :             : </span>
+<span id="L361"><span class="lineNum">     361</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[0] |= INTC_CTRL_LOCAL_EN_Msk;</span></span>
+<span id="L362"><span class="lineNum">     362</span>                 :<span class="tlaGNC">           1 :     g_sim_regs[8] = 5u;</span></span>
+<span id="L363"><span class="lineNum">     363</span>                 :<span class="tlaGNC">           1 :     intc_set_local_socket(0);</span></span>
+<span id="L364"><span class="lineNum">     364</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_ack(0x1u), -1, &quot;%d&quot;);</span></span>
+<span id="L365"><span class="lineNum">     365</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(g_sim_regs[5], 0x5u, &quot;0x%08X&quot;);   /* 被拒，ack 不变 */</span></span>
+<span id="L366"><span class="lineNum">     366</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L367"><span class="lineNum">     367</span>                 :             : </span>
+<span id="L368"><span class="lineNum">     368</span>                 :             : /* 11. 镜像模式：覆盖 hw_read/hw_write 三元 false 分支与 default_reg_* mirror 分支 */</span>
+<span id="L369"><span class="lineNum">     369</span>                 :<span class="tlaGNC">           1 : TEST_CASE(default_io_mirror_mode)</span></span>
+<span id="L370"><span class="lineNum">     370</span>                 :             : {</span>
+<span id="L371"><span class="lineNum">     371</span>                 :<span class="tlaGNC">           1 :     mirror_reset();</span></span>
+<span id="L372"><span class="lineNum">     372</span>                 :             : </span>
+<span id="L373"><span class="lineNum">     373</span>                 :<span class="tlaGNC">           1 :     intc_global_enable();</span></span>
+<span id="L374"><span class="lineNum">     374</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_is_global_enabled(), 1U, &quot;%u&quot;);</span></span>
+<span id="L375"><span class="lineNum">     375</span>                 :<span class="tlaGNC">           1 :     intc_global_disable();</span></span>
+<span id="L376"><span class="lineNum">     376</span>                 :<span class="tlaGNC">           1 :     intc_soft_reset();</span></span>
+<span id="L377"><span class="lineNum">     377</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_TRUE((g_mirror_regs[0] &amp; INTC_CTRL_SOFT_RESET_Msk) != 0u,</span></span>
+<span id="L378"><span class="lineNum">     378</span>                 :             :                 &quot;mirror soft_reset 失败, ctrl=0x%08X&quot;, g_mirror_regs[0]);</span>
+<span id="L379"><span class="lineNum">     379</span>                 :             : </span>
+<span id="L380"><span class="lineNum">     380</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_enable(0xFFu), 0, &quot;%d&quot;);</span></span>
+<span id="L381"><span class="lineNum">     381</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_enable(), 0xFFu, &quot;0x%08X&quot;);</span></span>
+<span id="L382"><span class="lineNum">     382</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_unmask(0xFFu), 0, &quot;%d&quot;);</span></span>
+<span id="L383"><span class="lineNum">     383</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_mask(), 0xFFFFFF00u, &quot;0x%08X&quot;);</span></span>
+<span id="L384"><span class="lineNum">     384</span>                 :             : </span>
+<span id="L385"><span class="lineNum">     385</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[3] = 0x12345678u;                       /* IRQ_RAW */</span></span>
+<span id="L386"><span class="lineNum">     386</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_raw(), 0x12345678u, &quot;0x%08X&quot;);</span></span>
+<span id="L387"><span class="lineNum">     387</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[4] = 0xABCDEF01u;                      /* IRQ_PENDING */</span></span>
+<span id="L388"><span class="lineNum">     388</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_irq_get_pending(), 0xABCDEF01u, &quot;0x%08X&quot;);</span></span>
+<span id="L389"><span class="lineNum">     389</span>                 :<span class="tlaGNC">           1 :     g_mirror_regs[9] = (1u &lt;&lt; SOCKET_STATUS_OWNER_ID_Pos) | SOCKET_STATUS_ACCESS_DENIED_Msk;</span></span>
+<span id="L390"><span class="lineNum">     390</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(intc_get_socket_status(), (1u &lt;&lt; SOCKET_STATUS_OWNER_ID_Pos) | SOCKET_STATUS_ACCESS_DENIED_Msk,</span></span>
+<span id="L391"><span class="lineNum">     391</span>                 :             :               &quot;0x%08X&quot;);</span>
+<span id="L392"><span class="lineNum">     392</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L393"><span class="lineNum">     393</span>                 :             : </span>
+<span id="L394"><span class="lineNum">     394</span>                 :             : /* 12. 默认 I/O 全部分支：probe(0) 镜像 + probe(1) volatile(mmap) */</span>
+<span id="L395"><span class="lineNum">     395</span>                 :<span class="tlaGNC">           1 : TEST_CASE(default_io_probe_all_branches)</span></span>
+<span id="L396"><span class="lineNum">     396</span>                 :             : {</span>
+<span id="L397"><span class="lineNum">     397</span>                 :<span class="tlaGNC">           1 :     intc_driver_ut_probe_default_io(0);   /* if mode==0 T, for 循环, mirror 路径 */</span></span>
+<span id="L398"><span class="lineNum">     398</span>                 :             : </span>
+<span id="L399"><span class="lineNum">     399</span>                 :<span class="tlaGNC">           1 :     int rc = ut_map_mmio_page();</span></span>
+<span id="L400"><span class="lineNum">     400</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_TRUE(rc == 0, &quot;mmap MAP_FIXED@0x40000000 失败, 无法覆盖 volatile 分支&quot;);</span></span>
+<span id="L401"><span class="lineNum">     401</span>                 :<span class="tlaGNC">           1 :     intc_driver_ut_probe_default_io(1);   /* if mode==0 F, volatile 路径 */</span></span>
+<span id="L402"><span class="lineNum">     402</span>                 :<span class="tlaGNC">           1 :     ut_unmap_mmio_page();</span></span>
+<span id="L403"><span class="lineNum">     403</span>                 :             : </span>
+<span id="L404"><span class="lineNum">     404</span>                 :<span class="tlaGNC">           1 :     ASSERT_TRUE(1, &quot;probe 执行完成（无段错误即通过）&quot;);</span></span>
+<span id="L405"><span class="lineNum">     405</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L406"><span class="lineNum">     406</span>                 :             : </span>
+<span id="L407"><span class="lineNum">     407</span>                 :             : /* 13. RO 寄存器写保护：驱动经 API 不应写 RO 寄存器 */</span>
+<span id="L408"><span class="lineNum">     408</span>                 :<span class="tlaGNC">           1 : TEST_CASE(ro_write_protection_via_sim)</span></span>
+<span id="L409"><span class="lineNum">     409</span>                 :             : {</span>
+<span id="L410"><span class="lineNum">     410</span>                 :<span class="tlaGNC">           1 :     sim_reset();</span></span>
+<span id="L411"><span class="lineNum">     411</span>                 :<span class="tlaGNC">           1 :     intc_driver_init();</span></span>
+<span id="L412"><span class="lineNum">     412</span>                 :<span class="tlaGNC">           1 :     intc_global_enable();</span></span>
+<span id="L413"><span class="lineNum">     413</span>                 :<span class="tlaGNC">           1 :     intc_global_disable();</span></span>
+<span id="L414"><span class="lineNum">     414</span>                 :<span class="tlaGNC">           1 :     intc_soft_reset();</span></span>
+<span id="L415"><span class="lineNum">     415</span>                 :<span class="tlaGNC">           1 :     intc_irq_enable(0xFu);</span></span>
+<span id="L416"><span class="lineNum">     416</span>                 :<span class="tlaGNC">           1 :     intc_irq_ack(0x5u);</span></span>
+<span id="L417"><span class="lineNum">     417</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(g_sim_ro_writes, 0U, &quot;%u&quot;);   /* 驱动 API 未写任何 RO 寄存器 */</span></span>
+<span id="L418"><span class="lineNum">     418</span>                 :             : </span>
+<span id="L419"><span class="lineNum">     419</span>                 :             :     /* 直接通过 sim 层写 RO 寄存器 → 计数 + 忽略 */</span>
+<span id="L420"><span class="lineNum">     420</span>                 :<span class="tlaGNC">           1 :     sim_reg_write(IRQ_RAW_ADDR, 0xDEADu);</span></span>
+<span id="L421"><span class="lineNum">     421</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(g_sim_ro_writes, 1U, &quot;%u&quot;);</span></span>
+<span id="L422"><span class="lineNum">     422</span>         [<span class="tlaGBC" title="Branch 0 was taken 1 time"> + </span><span class="tlaUNC" title="Branch 1 was not taken"> - </span>]:<span class="tlaGNC">           1 :     ASSERT_EQ(sim_reg_read(IRQ_RAW_ADDR), IRQ_RAW_RESET_VALUE, &quot;0x%08X&quot;);</span></span>
+<span id="L423"><span class="lineNum">     423</span>                 :<span class="tlaGNC">           1 : }</span></span>
+<span id="L424"><span class="lineNum">     424</span>                 :             : </span>
+<span id="L425"><span class="lineNum">     425</span>                 :             : /* -------------------------------------------------------------------------</span>
+<span id="L426"><span class="lineNum">     426</span>                 :             :  *                              主函数</span>
+<span id="L427"><span class="lineNum">     427</span>                 :             :  * ------------------------------------------------------------------------- */</span>
+<span id="L428"><span class="lineNum">     428</span>                 :<span class="tlaGNC">           1 : int main(void)</span></span>
+<span id="L429"><span class="lineNum">     429</span>                 :             : {</span>
+<span id="L430"><span class="lineNum">     430</span>                 :<span class="tlaGNC">           1 :     printf(&quot;=== IntcController (AXI 中断控制器) 驱动单元测试 ===\n\n&quot;);</span></span>
+<span id="L431"><span class="lineNum">     431</span>                 :             : </span>
+<span id="L432"><span class="lineNum">     432</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(init_reset_values);</span></span>
+<span id="L433"><span class="lineNum">     433</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(global_enable_disable);</span></span>
+<span id="L434"><span class="lineNum">     434</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(soft_reset);</span></span>
+<span id="L435"><span class="lineNum">     435</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(local_access_enable_disable);</span></span>
+<span id="L436"><span class="lineNum">     436</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(check_access_and_state);</span></span>
+<span id="L437"><span class="lineNum">     437</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(claim_socket);</span></span>
+<span id="L438"><span class="lineNum">     438</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(irq_enable_disable_access);</span></span>
+<span id="L439"><span class="lineNum">     439</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(irq_mask_unmask_access);</span></span>
+<span id="L440"><span class="lineNum">     440</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(irq_trigger_polarity);</span></span>
+<span id="L441"><span class="lineNum">     441</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(irq_ack_access);</span></span>
+<span id="L442"><span class="lineNum">     442</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(default_io_mirror_mode);</span></span>
+<span id="L443"><span class="lineNum">     443</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(default_io_probe_all_branches);</span></span>
+<span id="L444"><span class="lineNum">     444</span>                 :<span class="tlaGNC">           1 :     RUN_TEST(ro_write_protection_via_sim);</span></span>
+<span id="L445"><span class="lineNum">     445</span>                 :             : </span>
+<span id="L446"><span class="lineNum">     446</span>                 :<span class="tlaGNC">           1 :     printf(&quot;\n=== 汇总: PASS=%d, FAIL=%d ===\n&quot;, g_pass_cnt, g_fail_cnt);</span></span>
+<span id="L447"><span class="lineNum">     447</span>                 :<span class="tlaGNC">           1 :     return g_fail_cnt == 0 ? 0 : 1;</span></span>
+<span id="L448"><span class="lineNum">     448</span>                 :             : }</span>
+        </pre>
+              </td>
+            </tr>
+          </table>
+          <br>
+
+          <table width="100%" border=0 cellspacing=0 cellpadding=0>
+            <tr><td class="ruler"><img src="../glass.png" width=3 height=3 alt=""></td></tr>
+            <tr><td class="versionInfo">Generated by: <a href="https://github.com//linux-test-project/lcov" target="_parent">LCOV version 2.0-1</a></td></tr>
+          </table>
+          <br>
+
+</body>
+</html>

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# run_ut.sh — 编译运行 ModuleController 驱动单测并生成代码覆盖率报告
+# run_ut.sh — 编译运行 IntcController (AXI 中断控制器) 驱动单测并生成代码覆盖率报告
 #
 # 功能：
 #   1. 使用 gcc --coverage 编译驱动 + 测试
 #   2. 运行单测二进制
 #   3. 收集 gcov 数据 → coverage.info（开启 branch_coverage=1）
 #   4. 生成 coverage_html/ 报告（语句覆盖率 + 分支覆盖率分开显示）
-#   5. 在终端打印 module_driver.c 的独立汇总（目标文件覆盖率指标）
+#   5. 在终端打印 intc_driver.c 的独立汇总（目标文件覆盖率指标）
 #
 # 使用：
 #   bash run_ut.sh
@@ -19,7 +19,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-COV_EXE="test_module_driver_cov"
+COV_EXE="test_intc_driver_cov"
 INFO_FILE="coverage.info"
 HTML_DIR="coverage_html"
 
@@ -45,7 +45,7 @@ info "工具链就绪：gcc=$(gcc -dumpversion) lcov=$(lcov --version | head -1 
 
 # -------- 清理旧产物 --------
 title "清理旧覆盖率产物"
-rm -f *.gcno *.gcda *.gcov "$INFO_FILE" "$COV_EXE" "test_module_driver" "test_module_driver_plain"
+rm -f *.gcno *.gcda *.gcov "$INFO_FILE" "$COV_EXE"
 rm -rf "$HTML_DIR"
 info "已清理"
 
@@ -53,7 +53,7 @@ info "已清理"
 title "编译：gcc --coverage"
 gcc -std=c99 -Wall -Wextra -Werror -I. -O0 --coverage \
     -o "$COV_EXE" \
-    test_module_driver.c module_driver.c
+    test_intc_driver.c intc_driver.c
 info "编译成功：$SCRIPT_DIR/$COV_EXE"
 
 # -------- 运行单测 --------
@@ -74,10 +74,10 @@ lcov --capture \
      --quiet
 info "已生成 $INFO_FILE"
 
-# -------- 抽取 module_driver.c 的独立覆盖率（排除测试文件自身）--------
-DRIVER_INFO="/tmp/module_driver_coverage.info"
-# 使用 lcov --remove 移除 test_module_driver.c（更可靠，兼容 lcov 1.x / 2.x）
-lcov --remove "$INFO_FILE" "*test_module_driver.c" \
+# -------- 抽取 intc_driver.c 的独立覆盖率（排除测试文件自身）--------
+DRIVER_INFO="/tmp/intc_driver_coverage.info"
+# 使用 lcov --remove 移除 test_intc_driver.c（更可靠，兼容 lcov 1.x / 2.x）
+lcov --remove "$INFO_FILE" "*test_intc_driver.c" \
      --output-file "$DRIVER_INFO" \
      --rc branch_coverage=1 \
      --quiet
@@ -88,17 +88,17 @@ genhtml "$INFO_FILE" \
     --branch-coverage \
     --output-directory "$HTML_DIR" \
     --show-details \
-    --title "ModuleController Driver Coverage Report" \
+    --title "IntcController Driver Coverage Report" \
     --legend \
     --frames \
     --quiet
 
-# 同时再为 module_driver.c 单独生成一份子报告（方便快速跳转）
+# 同时再为 intc_driver.c 单独生成一份子报告（方便快速跳转）
 genhtml "$DRIVER_INFO" \
     --branch-coverage \
     --output-directory "$HTML_DIR/driver_only" \
     --show-details \
-    --title "module_driver.c Coverage (Lines & Branches Separated)" \
+    --title "intc_driver.c Coverage (Lines & Branches Separated)" \
     --legend \
     --frames \
     --quiet
@@ -111,7 +111,7 @@ title "覆盖率汇总（分开显示 Lines、Functions、Branches）"
 
 echo ""
 echo "────────────────────────────────────────────────────────────"
-echo "  整体 (module_driver.c + test_module_driver.c)"
+echo "  整体 (intc_driver.c + test_intc_driver.c)"
 echo "────────────────────────────────────────────────────────────"
 lcov --summary "$INFO_FILE" --rc branch_coverage=1 2>&1 | \
     sed -E 's/lines\.*: */语句覆盖率 (Line Coverage)  : /;
@@ -120,7 +120,7 @@ lcov --summary "$INFO_FILE" --rc branch_coverage=1 2>&1 | \
 
 echo ""
 echo "────────────────────────────────────────────────────────────"
-echo "  目标文件 module_driver.c（不含测试文件自身）"
+echo "  目标文件 intc_driver.c（不含测试文件自身）"
 echo "────────────────────────────────────────────────────────────"
 lcov --summary "$DRIVER_INFO" --rc branch_coverage=1 2>&1 | \
     sed -E 's/lines\.*: */语句覆盖率 (Line Coverage)  : /;
@@ -133,12 +133,12 @@ echo "  HTML 报告入口"
 echo "────────────────────────────────────────────────────────────"
 echo "  · 总览（含 Line + Branch 双栏显示）："
 echo "    file://$SCRIPT_DIR/$HTML_DIR/index.html"
-echo "  · module_driver.c 明细（Line/Branch 分栏 + 每行颜色高亮）："
+echo "  · intc_driver.c 明细（Line/Branch 分栏 + 每行颜色高亮）："
 echo "    file://$SCRIPT_DIR/$HTML_DIR/driver_only/index.html"
 echo ""
 
 # -------- 校验目标是否达成 100% Line + 100% Branch --------
-title "覆盖率目标校验（module_driver.c：语句 100% 且 分支 100%）"
+title "覆盖率目标校验（intc_driver.c：语句 100% 且 分支 100%）"
 
 # lcov --summary 输出样例：
 #   lines......: 100.0% (103 of 103 lines)
@@ -152,9 +152,9 @@ FUNC_RATE=$(echo "$DRIVER_SUMMARY" | sed -nE 's/.*functions\.*: +([0-9.]+)%.*/\1
 BRANCH_RATE=$(echo "$DRIVER_SUMMARY" | sed -nE 's/.*branches\.*: +([0-9.]+)%.*/\1/p')
 BRANCH_HIT=$(echo "$DRIVER_SUMMARY" | sed -nE 's/.*branches.*\(([0-9]+) of ([0-9]+) branches\).*/\1\/\2/p')
 
-echo "  module_driver.c 语句覆盖率 (Line)   = ${LINE_RATE}%  (${LINE_HIT:-N/A})"
-echo "  module_driver.c 函数覆盖率 (Func)   = ${FUNC_RATE}%"
-echo "  module_driver.c 分支覆盖率 (Branch) = ${BRANCH_RATE}%  (${BRANCH_HIT:-N/A})"
+echo "  intc_driver.c 语句覆盖率 (Line)   = ${LINE_RATE}%  (${LINE_HIT:-N/A})"
+echo "  intc_driver.c 函数覆盖率 (Func)   = ${FUNC_RATE}%"
+echo "  intc_driver.c 分支覆盖率 (Branch) = ${BRANCH_RATE}%  (${BRANCH_HIT:-N/A})"
 
 TARGET_OK=1
 case "${LINE_RATE:-0}" in
@@ -168,7 +168,7 @@ esac
 
 if [ "$TARGET_OK" = "1" ]; then
     echo ""
-    echo "${GREEN}${BOLD}✔ 达标：module_driver.c 语句覆盖率 100%，分支覆盖率 100%（两者分开显示于 HTML 报告）${RESET}"
+    echo "${GREEN}${BOLD}✔ 达标：intc_driver.c 语句覆盖率 100%，分支覆盖率 100%（两者分开显示于 HTML 报告）${RESET}"
     exit 0
 else
     echo ""

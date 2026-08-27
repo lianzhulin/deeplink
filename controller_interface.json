@@ -1,129 +1,126 @@
 {
   "controller": {
-    "name": "ModuleController",
-    "description": "模块控制器接口定义",
+    "name": "IntcController",
+    "description": "AXI 总线中断控制器：支持 32 路中断请求，每路独立使能/屏蔽，支持 local socket 访问控制",
     "version": "1.0.0",
+    "bus": "AXI4-Lite (32-bit data, 4-byte aligned, single-beat R/W)",
     "base_address": "0x40000000",
+    "num_irqs": 32,
     "registers": [
       {
-        "name": "CTRL_REG",
-        "description": "模块控制寄存器（可读写）",
+        "name": "INTC_CTRL",
+        "description": "全局控制寄存器（可读写）",
         "offset": "0x00",
         "access": "RW",
         "reset_value": "0x00000000",
         "width": 32,
         "fields": [
-          {
-            "name": "MODULE_EN",
-            "description": "模块开关控制位",
-            "bit_offset": 0,
-            "bit_width": 1,
-            "access": "RW",
-            "reset_value": 0,
-            "values": {
-              "0": "模块关闭",
-              "1": "模块开启"
-            }
-          },
-          {
-            "name": "SOFT_RESET",
-            "description": "软件复位控制位",
-            "bit_offset": 1,
-            "bit_width": 1,
-            "access": "RW",
-            "reset_value": 0,
-            "values": {
-              "0": "正常工作",
-              "1": "复位模块（自动清零）"
-            }
-          },
-          {
-            "name": "RESERVED",
-            "description": "保留位",
-            "bit_offset": 2,
-            "bit_width": 30,
-            "access": "RO",
-            "reset_value": 0,
-            "note": "写入忽略，读取为0"
-          }
+          { "name": "GLOBAL_EN", "description": "全局中断使能（总开关）", "bit_offset": 0, "bit_width": 1, "access": "RW", "reset_value": 0, "values": { "0": "全局关闭", "1": "全局使能" } },
+          { "name": "SOFT_RESET", "description": "软件复位（写 1 触发，硬件自动清零）", "bit_offset": 1, "bit_width": 1, "access": "RW", "reset_value": 0, "values": { "0": "正常工作", "1": "复位" } },
+          { "name": "LOCAL_EN", "description": "local socket 访问控制使能；为 1 时 IRQ_ENABLE/IRQ_MASK/SOCKET_ID 等敏感寄存器仅限 owner socket 写入", "bit_offset": 2, "bit_width": 1, "access": "RW", "reset_value": 0, "values": { "0": "开放访问", "1": "仅 owner socket 可写" } },
+          { "name": "RESERVED", "description": "保留", "bit_offset": 3, "bit_width": 29, "access": "RO", "reset_value": 0, "note": "写忽略，读为 0" }
         ]
       },
       {
-        "name": "STATUS_REG",
-        "description": "模块状态寄存器（只读）",
+        "name": "IRQ_ENABLE",
+        "description": "32 路中断独立使能位（bit i = IRQ i 使能）",
         "offset": "0x04",
+        "access": "RW",
+        "reset_value": "0x00000000",
+        "width": 32,
+        "fields": [
+          { "name": "ENABLE", "description": "每路中断独立使能", "bit_offset": 0, "bit_width": 32, "access": "RW", "reset_value": 0, "note": "bit i 对应 IRQ i，1=使能" }
+        ]
+      },
+      {
+        "name": "IRQ_MASK",
+        "description": "32 路中断独立屏蔽位（bit i = 1 表示屏蔽 IRQ i；复位默认全屏蔽以保安全）",
+        "offset": "0x08",
+        "access": "RW",
+        "reset_value": "0xFFFFFFFF",
+        "width": 32,
+        "fields": [
+          { "name": "MASK", "description": "每路中断独立屏蔽", "bit_offset": 0, "bit_width": 32, "access": "RW", "reset_value": 4294967295, "note": "bit i 对应 IRQ i，1=屏蔽" }
+        ]
+      },
+      {
+        "name": "IRQ_RAW",
+        "description": "32 路中断原始输入（屏蔽/使能前）",
+        "offset": "0x0C",
         "access": "RO",
         "reset_value": "0x00000000",
         "width": 32,
         "fields": [
-          {
-            "name": "MODULE_STATE",
-            "description": "模块工作状态",
-            "bit_offset": 0,
-            "bit_width": 2,
-            "access": "RO",
-            "reset_value": 0,
-            "values": {
-              "0": "IDLE（空闲）",
-              "1": "RUNNING（运行中）",
-              "2": "BUSY（忙碌）",
-              "3": "ERROR（错误）"
-            }
-          },
-          {
-            "name": "FIFO_EMPTY",
-            "description": "FIFO空标志",
-            "bit_offset": 2,
-            "bit_width": 1,
-            "access": "RO",
-            "reset_value": 1,
-            "values": {
-              "0": "FIFO非空",
-              "1": "FIFO为空"
-            }
-          },
-          {
-            "name": "FIFO_FULL",
-            "description": "FIFO满标志",
-            "bit_offset": 3,
-            "bit_width": 1,
-            "access": "RO",
-            "reset_value": 0,
-            "values": {
-              "0": "FIFO未满",
-              "1": "FIFO为满"
-            }
-          },
-          {
-            "name": "ERR_FLAG",
-            "description": "错误标志位",
-            "bit_offset": 4,
-            "bit_width": 1,
-            "access": "RO",
-            "reset_value": 0,
-            "values": {
-              "0": "无错误",
-              "1": "检测到错误，查看ERR_CODE"
-            }
-          },
-          {
-            "name": "ERR_CODE",
-            "description": "错误代码",
-            "bit_offset": 8,
-            "bit_width": 8,
-            "access": "RO",
-            "reset_value": 0,
-            "note": "仅当ERR_FLAG=1时有效"
-          },
-          {
-            "name": "RESERVED",
-            "description": "保留位",
-            "bit_offset": 16,
-            "bit_width": 16,
-            "access": "RO",
-            "reset_value": 0,
-            "note": "读取为0"
-          }
+          { "name": "RAW", "description": "原始中断输入", "bit_offset": 0, "bit_width": 32, "access": "RO", "reset_value": 0 }
+        ]
+      },
+      {
+        "name": "IRQ_PENDING",
+        "description": "32 路中断最终 pending（= RAW & ENABLE & ~MASK），只读",
+        "offset": "0x10",
+        "access": "RO",
+        "reset_value": "0x00000000",
+        "width": 32,
+        "fields": [
+          { "name": "PENDING", "description": "pending 中断", "bit_offset": 0, "bit_width": 32, "access": "RO", "reset_value": 0 }
+        ]
+      },
+      {
+        "name": "IRQ_ACK",
+        "description": "写 1 清除对应 pending 位（W1C）",
+        "offset": "0x14",
+        "access": "RW",
+        "reset_value": "0x00000000",
+        "width": 32,
+        "fields": [
+          { "name": "ACK", "description": "写 1 清 pending", "bit_offset": 0, "bit_width": 32, "access": "RW", "reset_value": 0, "note": "W1C：写 1 清除对应 IRQ 的 pending" }
+        ]
+      },
+      {
+        "name": "IRQ_TRIGGER",
+        "description": "每路中断触发类型（bit i = 0 电平触发, 1 边沿触发）",
+        "offset": "0x18",
+        "access": "RW",
+        "reset_value": "0x00000000",
+        "width": 32,
+        "fields": [
+          { "name": "TRIGGER", "description": "触发类型", "bit_offset": 0, "bit_width": 32, "access": "RW", "reset_value": 0, "note": "0=电平, 1=边沿" }
+        ]
+      },
+      {
+        "name": "IRQ_POLARITY",
+        "description": "每路中断极性（bit i = 0 低有效, 1 高有效；复位默认全高有效）",
+        "offset": "0x1C",
+        "access": "RW",
+        "reset_value": "0xFFFFFFFF",
+        "width": 32,
+        "fields": [
+          { "name": "POLARITY", "description": "极性", "bit_offset": 0, "bit_width": 32, "access": "RW", "reset_value": 4294967295, "note": "0=低有效, 1=高有效" }
+        ]
+      },
+      {
+        "name": "SOCKET_ID",
+        "description": "当前持有 local 访问权限的 socket ID（0~255）",
+        "offset": "0x20",
+        "access": "RW",
+        "reset_value": "0x00000000",
+        "width": 32,
+        "fields": [
+          { "name": "ID", "description": "owner socket ID", "bit_offset": 0, "bit_width": 8, "access": "RW", "reset_value": 0 },
+          { "name": "RESERVED", "description": "保留", "bit_offset": 8, "bit_width": 24, "access": "RO", "reset_value": 0 }
+        ]
+      },
+      {
+        "name": "SOCKET_STATUS",
+        "description": "socket 访问状态（只读）",
+        "offset": "0x24",
+        "access": "RO",
+        "reset_value": "0x00000000",
+        "width": 32,
+        "fields": [
+          { "name": "LOCKED", "description": "socket 锁定状态（1=已有 socket 持有）", "bit_offset": 0, "bit_width": 1, "access": "RO", "reset_value": 0 },
+          { "name": "OWNER_ID", "description": "当前 owner socket ID", "bit_offset": 8, "bit_width": 8, "access": "RO", "reset_value": 0 },
+          { "name": "ACCESS_DENIED", "description": "粘滞位：最近一次写被拒绝时置 1", "bit_offset": 16, "bit_width": 1, "access": "RO", "reset_value": 0 }
         ]
       }
     ]
