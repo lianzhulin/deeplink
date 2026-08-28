@@ -1,7 +1,6 @@
 # 编译产物
-test_module_driver
-test_module_driver_cov
-test_module_driver_plain
+test_intc_driver
+test_intc_driver_cov
 *.o
 *.obj
 *.a
