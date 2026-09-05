@@ -28,3 +28,7 @@ Thumbs.db
 
 # Trae 共享包缓存
 .trae-html-share-packages/
+
+# Python
+__pycache__/
+*.pyc
