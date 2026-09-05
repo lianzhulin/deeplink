@@ -30,44 +30,35 @@ TTL_SECONDS = 5 * 60          # 寄存有效期, 秒
 
 # 柜子: {token(str, 4位): {"data": str, "expires_at": float}}
 lockers = {}
+# 空闲池: 全集 [0000..MAX_TOKEN] 中不在 lockers 里的 token, 预先 shuffle
+# 与 lockers 互补: 每次删除 lockers 项 (过期清理 / 取回销毁) 都要 append 回来
+free_pool: list[str] = [str(i).zfill(TOKEN_DIGITS) for i in range(MAX_TOKEN + 1)]
+random.shuffle(free_pool)
 lockers_lock = threading.Lock()
 
 
 def _purge_expired():
-    """懒清理: 从字典里删掉过期项. 必须在 lockers_lock 内调用."""
+    """懒清理: 清 lockers 里的过期项, 并把 token 放回 free_pool. 必须在 lockers_lock 内."""
     now = time.time()
     expired = [t for t, v in lockers.items() if v["expires_at"] <= now]
     for t in expired:
         del lockers[t]
+        free_pool.append(t)
 
 
 def _allocate_random_token() -> str | None:
     """
-    从 [0000, MAX_TOKEN] 随机挑一个空闲号 (含过期的).
+    从 free_pool 里随机抽一个 (Fisher-Yates: 随机位置 swap 到末尾再 pop, O(1)).
     已在 lockers_lock 内.
     """
     _purge_expired()
-    if len(lockers) >= MAX_SLOTS:
+    # 有效凭证数量硬上限: 不超 MAX_SLOTS (全集的一半)
+    if len(lockers) >= MAX_SLOTS or not free_pool:
         return None
-
-    # 策略: 最多试 200 次随机碰撞, 还撞就退化为"用剩余集合整体抽取"
-    tried = set()
-    for _ in range(200):
-        n = random.randint(0, MAX_TOKEN)
-        token = str(n).zfill(TOKEN_DIGITS)
-        if token not in lockers:
-            return token
-        tried.add(token)
-
-    # 退化: 全集 - 已用 = 可用集合, random choice
-    used = set(lockers.keys())
-    # 再剔除已试过的, 减少后续范围
-    candidates = [str(i).zfill(TOKEN_DIGITS)
-                  for i in range(MAX_TOKEN + 1)
-                  if str(i).zfill(TOKEN_DIGITS) not in used]
-    if not candidates:
-        return None
-    return random.choice(candidates)
+    idx = random.randrange(len(free_pool))
+    idx_last = len(free_pool) - 1
+    free_pool[idx], free_pool[idx_last] = free_pool[idx_last], free_pool[idx]
+    return free_pool.pop()
 
 
 # ---------- 页面 ----------
@@ -257,9 +248,10 @@ class Handler(BaseHTTPRequestHandler):
             if item is None:
                 self._send_json({"ok": False, "msg": "凭证无效或已过期"}, 404)
                 return
-            # 取回即销毁
+            # 取回即销毁, token 回收到 free_pool
             data = item["data"]
             del lockers[token]
+            free_pool.append(token)
 
         self._send_json({"ok": True, "data": data})
 
