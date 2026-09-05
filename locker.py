@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-电子寄存柜原型 - 单文件 Python 实现
-====================================
+电子寄存柜原型 - 单文件 Python 实现 (内存版)
+==============================================
 特性:
-  * 零依赖, 仅用标准库 (http.server + threading + json)
-  * 凭证为三位数字 001-999 (可通过 CAPACITY 扩容)
-  * 寄存后返回凭证, 取回需输入正确凭证
-  * 默认 TTL=300 秒 (5 分钟), 过期自动销毁
-  * 后期可扩展: 支持更多数据类型 / 持久化存储 / 分布式扩容
+  * 零依赖, 仅标准库
+  * 纯内存存储, 不做任何持久化, 进程重启即清空
+  * 四位随机凭证号 0000-9999, 实际容量上限 MAX_SLOTS (默认 4999, 即不超一半)
+  * 懒清理: 不启动后台线程, 存取操作时顺手回收过期项
+  * 默认 TTL=300 秒 (5 分钟), 过期自动失效
+  * 取回即销毁: 一次性凭证, 取回后立即可被重新分配
 
 启动: python3 locker.py [端口号]   (默认 8000)
 """
@@ -15,44 +16,61 @@
 import sys
 import json
 import time
+import random
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-# ---------- 可配置项 ----------
-CAPACITY = 999                       # 凭证容量, 改大可扩容 (如 9999 四位)
-TOKEN_LEN = len(str(CAPACITY))       # 凭证长度自动跟随 CAPACITY
-TTL_SECONDS = 5 * 60                 # 寄存有效期, 秒
-CLEANUP_INTERVAL = 10                # 过期清理线程间隔, 秒
+# ---------- 安全配置 ----------
+TOKEN_DIGITS = 4              # 凭证位数: 4 位 -> 0000-9999
+MAX_TOKEN = 10 ** TOKEN_DIGITS - 1
+MAX_SLOTS = MAX_TOKEN // 2    # 实际容量不超过一半: 4999
+TTL_SECONDS = 5 * 60          # 寄存有效期, 秒
 # ------------------------------
 
-# 柜子: {token(str): {"data": str, "expires_at": float}}
+# 柜子: {token(str, 4位): {"data": str, "expires_at": float}}
 lockers = {}
 lockers_lock = threading.Lock()
 
 
-def cleanup_loop():
-    """后台线程: 定期清理过期寄存"""
-    while True:
-        now = time.time()
-        with lockers_lock:
-            expired = [t for t, v in lockers.items() if v["expires_at"] <= now]
-            for t in expired:
-                del lockers[t]
-        time.sleep(CLEANUP_INTERVAL)
+def _purge_expired():
+    """懒清理: 从字典里删掉过期项. 必须在 lockers_lock 内调用."""
+    now = time.time()
+    expired = [t for t, v in lockers.items() if v["expires_at"] <= now]
+    for t in expired:
+        del lockers[t]
 
 
-def allocate_token():
-    """从 001..CAPACITY 找一个空位, 格式化返回. 全部占满返回 None."""
-    for i in range(1, CAPACITY + 1):
-        token = str(i).zfill(TOKEN_LEN)
+def _allocate_random_token() -> str | None:
+    """
+    从 [0000, MAX_TOKEN] 随机挑一个空闲号 (含过期的).
+    已在 lockers_lock 内.
+    """
+    _purge_expired()
+    if len(lockers) >= MAX_SLOTS:
+        return None
+
+    # 策略: 最多试 200 次随机碰撞, 还撞就退化为"用剩余集合整体抽取"
+    tried = set()
+    for _ in range(200):
+        n = random.randint(0, MAX_TOKEN)
+        token = str(n).zfill(TOKEN_DIGITS)
         if token not in lockers:
             return token
-    return None
+        tried.add(token)
+
+    # 退化: 全集 - 已用 = 可用集合, random choice
+    used = set(lockers.keys())
+    # 再剔除已试过的, 减少后续范围
+    candidates = [str(i).zfill(TOKEN_DIGITS)
+                  for i in range(MAX_TOKEN + 1)
+                  if str(i).zfill(TOKEN_DIGITS) not in used]
+    if not candidates:
+        return None
+    return random.choice(candidates)
 
 
-# ---------- 页面 (纯 HTML, 内嵌 CSS/JS, 无外部资源) ----------
-# 注意: 下面两个页面使用 f-string, JS 里的 `${xxx}` 必须写成 `${{xxx}}`
+# ---------- 页面 ----------
 
 PAGE_STYLE = """
 <style>
@@ -70,7 +88,6 @@ PAGE_STYLE = """
   button { width: 100%; padding: 12px; background: #2563eb; color: #fff;
        border: none; border-radius: 6px; font-size: 15px; cursor: pointer; margin-top: 12px; }
   button:hover { background: #1d4ed8; }
-  button:disabled { background: #93c5fd; cursor: not-allowed; }
   button.copy { width: auto; padding: 6px 14px; background: #16a34a; font-size: 13px; margin-top: 8px; }
   .result { margin-top: 20px; padding: 16px; border-radius: 8px;
        background: #f1f5f9; font-size: 14px; word-break: break-all; white-space: pre-wrap; }
@@ -102,7 +119,7 @@ STORE_BODY = f"""
   <button type="submit">存入</button>
 </form>
 <div id="storeResult"></div>
-<p class="hint">有效期 {TTL_SECONDS // 60} 分钟 · 容量 {CAPACITY} 个柜子</p>
+<p class="hint">有效期 {TTL_SECONDS // 60} 分钟 · 凭证随机分配 · 仅内存存储</p>
 <script>
 document.getElementById('storeForm').addEventListener('submit', async e => {{
   e.preventDefault();
@@ -116,7 +133,7 @@ document.getElementById('storeForm').addEventListener('submit', async e => {{
   const box = document.getElementById('storeResult');
   if (j.ok) {{
     box.innerHTML = '<div class="result success">'
-      + '已存入, 请记住凭证号:'
+      + '已存入, 请记住凭证号 (仅显示一次):'
       + '<div class="token-big">' + j.token + '</div>'
       + '有效期至 ' + j.expire_time + '</div>';
   }} else {{
@@ -130,7 +147,7 @@ PAGE_STORE = _page_base("store", STORE_BODY)
 
 RETRIEVE_BODY = f"""
 <form id="retrieveForm">
-  <input type="text" id="token" placeholder="输入凭证号 (三位数字)" maxlength="{TOKEN_LEN}">
+  <input type="text" id="token" placeholder="输入四位凭证号" maxlength="{TOKEN_DIGITS}">
   <button type="submit">取回</button>
 </form>
 <div id="retrieveResult"></div>
@@ -216,9 +233,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         with lockers_lock:
-            token = allocate_token()
+            token = _allocate_random_token()
             if token is None:
-                self._send_json({"ok": False, "msg": f"柜子已满 (上限 {CAPACITY}), 请稍后再试"}, 503)
+                self._send_json({"ok": False, "msg": "柜子已满, 请稍后再试"}, 503)
                 return
             expires_at = time.time() + TTL_SECONDS
             lockers[token] = {"data": data, "expires_at": expires_at}
@@ -227,21 +244,20 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": True, "token": token, "expire_time": expire_str})
 
     def _handle_get(self, token: str):
-        # 只保留数字字符, 补齐长度, 截到上限
-        token = "".join(c for c in token if c.isdigit()).zfill(TOKEN_LEN)[:TOKEN_LEN]
-        if not token.isdigit():
+        # 只保留数字, 截断到 TOKEN_DIGITS 位
+        token = "".join(c for c in token if c.isdigit())[:TOKEN_DIGITS]
+        if len(token) != TOKEN_DIGITS or not token.isdigit():
             self._send_json({"ok": False, "msg": "凭证格式错误"}, 400)
             return
 
-        now = time.time()
         with lockers_lock:
+            # 先顺手清一遍过期
+            _purge_expired()
             item = lockers.get(token)
-            if item is None or item["expires_at"] <= now:
-                if item:
-                    del lockers[token]  # 懒清理
+            if item is None:
                 self._send_json({"ok": False, "msg": "凭证无效或已过期"}, 404)
                 return
-            # 取回即销毁: 一次性凭证
+            # 取回即销毁
             data = item["data"]
             del lockers[token]
 
@@ -250,13 +266,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-
-    t = threading.Thread(target=cleanup_loop, daemon=True)
-    t.start()
-
     server = HTTPServer(("0.0.0.0", port), Handler)
     print(f"电子寄存柜已启动  http://0.0.0.0:{port}")
-    print(f"  容量: {CAPACITY}  凭证长度: {TOKEN_LEN}  有效期: {TTL_SECONDS}s")
+    print(f"  凭证: {TOKEN_DIGITS} 位随机  容量上限: {MAX_SLOTS}  TTL: {TTL_SECONDS}s  仅内存")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
