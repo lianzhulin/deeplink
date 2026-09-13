@@ -68,10 +68,26 @@ static void *arena_alloc(size_t n)
 static void arena_free(void *p)
 {
     if (!p) return;
+
+    /* P1-4 硬化：对齐检查 —— posix_memalign(16) 分的块，用户不该传不对齐的指针 */
+    if (((uintptr_t)p & 0xF) != 0) {
+        fprintf(stderr, "[mm] arena_free: pointer %p not 16-byte aligned, rejected\n", p);
+        return;
+    }
+
     mk_block_t *b = (mk_block_t *)((unsigned char *)p - MK_BLOCK_HEADER_SIZE);
+
     if ((unsigned char *)b < g_arena || (unsigned char *)b >= g_arena + MK_MM_ARENA_SIZE) {
+        fprintf(stderr, "[mm] arena_free: pointer %p out of arena, rejected\n", p);
         return;   /* 越界，忽略 */
     }
+
+    /* P1-4 硬化：double-free 检测 */
+    if (!b->inuse) {
+        fprintf(stderr, "[mm] arena_free: double-free at %p (block already free)\n", p);
+        return;
+    }
+
     b->inuse = 0;
 
     /* 向后合并 */
@@ -101,7 +117,7 @@ static int32_t arena_total_used(void)
 }
 
 /* ---- mm 任务入口 ---- */
-static void mm_task(void *arg)
+void mm_task(void *arg)
 {
     (void)arg;
     arena_init();

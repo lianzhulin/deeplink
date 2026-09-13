@@ -192,6 +192,11 @@ mk_err_t mk_ipc_reply(uint8_t to, const mk_msg_t *msg)
     if (to >= MK_MAX_TASKS || to == self) return MK_ERR_INVALID;
     if (!msg) return MK_ERR_INVALID;
 
+    /* P0-2 硬化：reply_id==0 直接拒，不扫 32 个 slot。
+     * g_reply_counter 从 1 开始，0 永远不可能是合法 token。
+     * 开发者忘了写 reply.reply_id = req.reply_id 时会撞到这里。 */
+    if (msg->reply_id == 0) return MK_ERR_INVALID;
+
     mk_tcb_t     *to_tcb   = mk_tcb_get(to);
     mk_mailbox_t *dst_mbox = &g_mboxes[to];      /* reply 目标的 mailbox (send 者的 inbox) */
     mk_mailbox_t *my_mbox  = &g_mboxes[self];     /* 我 reply 者自己的 mailbox */
@@ -234,4 +239,63 @@ bool mk_ipc_poll(void)
 {
     uint8_t tid = mk_current_tid();
     return !q_empty(&g_mboxes[tid]);
+}
+
+/* ================================================================
+ *  mk_ipc_cleanup_dead_service — 服务者死亡时清理它的 IPC 状态
+ *
+ *  必须在 mk_task_exit 调 —— 否则：
+ *    client 正在 send_wait 等这个服务者 reply
+ *    服务者死了 → inflight 永远不被清 → 永远不 wake_send_waiter
+ *    → 那些 client 永久 BLOCKED，整个系统卡死
+ *
+ *  两步：
+ *    1. 扫 inflight[] 里所有 slot —— 每个对应一个还在等 reply 的 client
+ *       给每个 client 推一条 synthetic error reply（tag=0 表示"服务已死"）
+ *       调 wake_send_waiter 解它的阻塞
+ *    2. 清空 mailbox 队列 —— 时刻 A（send 刚入队还没被 receive）的残留
+ *       这些消息的 inflight 已经被上面处理过了，队列只是留着脏数据
+ *       下次 tid 被重用时脏队列会引发错觉
+ * ================================================================ */
+void mk_ipc_cleanup_dead_service(uint8_t dead_tid)
+{
+    if (dead_tid >= MK_MAX_TASKS) return;
+
+    mk_mailbox_t *my = &g_mboxes[dead_tid];
+
+    for (uint8_t i = 0; i < MK_IPC_QUEUE_SIZE; ++i) {
+        if (!my->inflight[i]) continue;
+
+        uint8_t  client   = my->slots[i].from;
+        uint16_t reply_id = my->reply_id_of_slot[i];
+
+        /* 清 inflight（我死了，这笔账结不了） */
+        my->inflight[i] = false;
+        my->reply_id_of_slot[i] = 0;
+
+        /* 防御性边界：from 必须是合法 tid */
+        if (client >= MK_MAX_TASKS) continue;
+
+        /* 给 client 推 synthetic reply —— tag=0 约定"服务已死"
+         * reply_id 必须是那个 client send 时内核分配的 token，
+         * 这样 client.unblock() 后 receive() 能正常读到 */
+        mk_msg_t err;
+        memset(&err, 0, sizeof(err));
+        err.reply_id = reply_id;
+        err.from     = dead_tid;   /* 内核填，虽然 reply_id 更关键 */
+        /* err.data[0] = MK_ERR_NOIPC = -1 —— client 的 mk_ipc_send 返回后
+         * 应该 receive 这条消息时能看到服务已死 */
+        err.data[0]  = MK_ERR_NOIPC;
+
+        mk_mailbox_t *dst = &g_mboxes[client];
+        q_push(dst, &err);
+
+        /* 解 client 的 send_wait —— 相当于 reply() 做的事 */
+        wake_send_waiter(client);
+    }
+
+    /* 清空残留队列 —— 时刻 A 的 send 还没被 receive */
+    while (!q_empty(my)) {
+        q_pop(my, NULL);
+    }
 }

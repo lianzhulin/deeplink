@@ -78,4 +78,9 @@ mk_err_t mk_ipc_reply(uint8_t to, const mk_msg_t *msg);
 /* 非阻塞探测：自己的 mailbox 队是否空 */
 bool     mk_ipc_poll(void);
 
+/* 内核内部用：服务者死亡时清 inflight + 解所有阻塞 client。
+ * 必须在 mk_task_exit 里调，否则 client 会永久 BLOCKED。
+ * 普通任务不应直接调 —— 由 task 模块在 exit 时自动触发。 */
+void     mk_ipc_cleanup_dead_service(uint8_t dead_tid);
+
 #endif /* MK_IPC_H */

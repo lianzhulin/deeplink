@@ -13,6 +13,7 @@
 
 #include "kernel.h"
 #include "task.h"
+#include "ipc.h"
 
 /* ---- TCB 数组：静态分配，最多 32 个 ---- */
 static mk_tcb_t   g_tasks[MK_MAX_TASKS];
@@ -117,9 +118,26 @@ int mk_task_create(const char *name, mk_task_entry_t entry,
 /* ---- 自杀 ---- */
 void mk_task_exit(void)
 {
+    /* 防御：g_current 边界检查 —— 正常路径不会到这里，
+     * 但 exit 是收尾函数，调度器 race 或上下文错乱时要兜底 */
+    if (g_current >= MK_MAX_TASKS) {
+        fprintf(stderr, "mk_task_exit: g_current=%u out of range, abort\n", g_current);
+        abort();
+    }
+
     uint8_t tid = g_current;
     mk_tcb_t *tcb = &g_tasks[tid];
 
+    /* ---- P0-1 硬化：IPC cleanup 必须在任何资源释放之前 ----
+     * 我的 inflight[] 里可能有还在等 reply 的 client。
+     * 如果我先把自己从 ready_mask 拿掉、free stack，
+     * 那些 client 的 send_wait 永远不会被解 → 永久 BLOCKED。
+     * cleanup 会：
+     *   1. 扫 inflight[] → 给每个 client 推 synthetic error reply → wake_send_waiter
+     *   2. 清空 mailbox 队列残留（还没被 receive 的 send 消息） */
+    mk_ipc_cleanup_dead_service(tid);
+
+    /* 然后正常收尾 */
     tcb->state = MK_TASK_DEAD;
     if (tcb->stack) {
         free(tcb->stack);
