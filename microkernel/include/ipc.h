@@ -22,12 +22,13 @@ typedef struct mk_msg {
     int32_t  data[MK_IPC_MSG_WORDS];
 } mk_msg_t;
 
-/* ---- 每个任务一个 mailbox：4 槽环形队列 + 一个 reply waiter ----
+/* ---- 每个任务一个 mailbox：环形队列 + reply waiter ----
  *
- * 环形队列解决多生产者同时 send 覆盖单槽的问题。
- * 队列满时 send 会阻塞自己（等 receive 空出槽位）。
+ * 队列大小 = MK_MAX_TASKS（32），意味着"其他所有任务同时 send 到我"
+ * 这种最坏情况也能容纳，不会丢消息。
+ * reply_to 是单槽：记录最近一个 send 等谁 reply。
  */
-#define MK_IPC_QUEUE_SIZE 4
+#define MK_IPC_QUEUE_SIZE MK_MAX_TASKS
 
 typedef struct {
     mk_msg_t   slots[MK_IPC_QUEUE_SIZE];
