@@ -96,7 +96,6 @@ mk_err_t mk_ipc_send(uint8_t to, const mk_msg_t *msg)
 
     mk_msg_t full_msg = *msg;
     full_msg.from = self;
-    full_msg.to   = to;
 
     /* 队列满 → 丢最老的，再 push。原型简化，避免阻塞 send。 */
     if (q_full(dst_mbox)) {
@@ -163,7 +162,6 @@ mk_err_t mk_ipc_reply(uint8_t to, const mk_msg_t *msg)
 
     mk_msg_t full_msg = *msg;
     full_msg.from = self;
-    full_msg.to   = to;
 
     /* 投递 reply。队列满 → 丢最老。原型不阻塞 reply。 */
     if (q_full(dst_mbox)) {

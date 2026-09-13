@@ -2,24 +2,31 @@
  * ipc.h — IPC 三原语：send / receive / reply
  *
  * 微内核风格的同步消息传递：
- *   send    - 发送一条消息到目标任务；如果目标在等这条消息（receive），立即唤醒 sender
+ *   send    - 发送一条消息到目标任务；同步阻塞等对方 reply
  *   receive - 阻塞自己直到某个 sender 给我发消息
- *   reply   - 给之前在等我 reply 的 sender 回一条
+ *   reply   - 给等我 reply 的 sender 回一条；自己不阻塞
  *
- * 每条消息是 mk_msg_t，大小固定。大消息通过页共享（当前原型不做）。
+ * 消息体 = 20 字节：tag(2) + from(1) + flags(1) + data[4](16)。
+ * 微内核哲学：IPC 传小消息，大消息走页共享（当前原型不做共享页）。
  */
 #ifndef MK_IPC_H
 #define MK_IPC_H
 
 #include "kernel.h"
 
-#define MK_IPC_MSG_WORDS  16    /* 每条消息最多 16 个 32-bit word = 64 字节 */
-
+/* ---- mk_msg_t：20 字节，无 padding ----
+ *
+ * 布局：offset 0-3 = tag(2) + from(1) + flags(1)，天然对齐到 int32_t data[0]
+ *       offset 4-19 = data[4] = 16 字节 payload
+ *       sizeof = 20（尾部 int32_t 对齐补 0，刚好）
+ *
+ * 删掉了 to 字段：send()/reply() 调用者已知目标 tid；
+ * 内核只填 from（send 者身份，receive 方要它来 reply）。 */
 typedef struct mk_msg {
-    uint8_t  from;              /* 发送者 tid（内核填） */
-    uint8_t  to;                /* 接收者 tid（内核填） */
-    uint16_t tag;               /* 用户自定义标签，路由用 */
-    int32_t  data[MK_IPC_MSG_WORDS];
+    uint16_t  tag;           /* 用户路由标签 */
+    uint8_t   from;          /* 内核填：发送者 tid */
+    uint8_t   flags;         /* 预留（如：是否需要 reply、优先级等） */
+    int32_t   data[4];       /* 4 个 word = 16 字节 payload */
 } mk_msg_t;
 
 /* ---- 每个任务一个 mailbox：环形队列 + reply waiter ----
