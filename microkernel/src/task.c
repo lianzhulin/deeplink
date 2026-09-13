@@ -18,6 +18,95 @@
 /* ---- TCB 数组：静态分配，最多 32 个 ---- */
 static mk_tcb_t   g_tasks[MK_MAX_TASKS];
 
+/* ================================================================
+ *  TCB 硬化基础设施
+ *  canary + 状态机白名单 + ctx/stack 完整性
+ * ================================================================ */
+
+static void tcb_init_canary(mk_tcb_t *tcb)
+{
+    tcb->canary_head = MK_TCB_CANARY_HEAD;
+    tcb->canary_tail = MK_TCB_CANARY_TAIL;
+}
+
+static void tcb_check_canary(const mk_tcb_t *tcb)
+{
+    if (tcb->canary_head != MK_TCB_CANARY_HEAD
+            || tcb->canary_tail != MK_TCB_CANARY_TAIL) {
+        fprintf(stderr,
+            "FATAL: TCB canary corrupted tid=%u head=0x%llX tail=0x%llX\n",
+            tcb->tid,
+            (unsigned long long)tcb->canary_head,
+            (unsigned long long)tcb->canary_tail);
+        abort();
+    }
+}
+
+/* ctx/stack 完整性 —— swapcontext 前调 */
+static void tcb_check_ctx_integrity(const mk_tcb_t *tcb)
+{
+    if (tcb->ctx.uc_stack.ss_sp   != tcb->stack
+            || tcb->ctx.uc_stack.ss_size != tcb->stack_size
+            || tcb->ctx.uc_link  != NULL) {
+        fprintf(stderr,
+            "FATAL: TCB ctx integrity fail tid=%u "
+            "ctx.ss_sp=%p tcb.stack=%p "
+            "ctx.ss_size=%zu tcb.stack_size=%zu "
+            "ctx.uc_link=%p (expect NULL)\n",
+            tcb->tid,
+            tcb->ctx.uc_stack.ss_sp, tcb->stack,
+            tcb->ctx.uc_stack.ss_size, tcb->stack_size,
+            tcb->ctx.uc_link);
+        abort();
+    }
+}
+
+/* 状态机 helper —— 所有 state 写点必须走这里
+ * 白名单转换：
+ *   DEAD      → DEAD/READY
+ *   READY     → READY/RUNNING
+ *   RUNNING   → READY/BLOCKED/SLEEPING
+ *   BLOCKED   → READY/DEAD
+ *   SLEEPING  → READY/DEAD
+ *   任意      → DEAD (mk_task_exit) */
+void mk_tcb_set_state(mk_tcb_t *tcb, mk_task_state_t new_state)
+{
+    tcb_check_canary(tcb);   /* canary 先过 */
+
+    mk_task_state_t cur = tcb->state;
+    bool ok = true;
+    switch (cur) {
+    case MK_TASK_DEAD:
+        ok = (new_state == MK_TASK_DEAD || new_state == MK_TASK_READY);
+        break;
+    case MK_TASK_READY:
+        ok = (new_state == MK_TASK_READY || new_state == MK_TASK_RUNNING);
+        break;
+    case MK_TASK_RUNNING:
+        ok = (new_state == MK_TASK_READY
+                || new_state == MK_TASK_BLOCKED
+                || new_state == MK_TASK_SLEEPING);
+        break;
+    case MK_TASK_BLOCKED:
+    case MK_TASK_SLEEPING:
+        ok = (new_state == MK_TASK_READY || new_state == MK_TASK_DEAD);
+        break;
+    default:
+        ok = false;
+    }
+
+    /* Escape hatch: 任何状态 → DEAD 都合法（mk_task_exit 在任何时机都能被调） */
+    if (new_state == MK_TASK_DEAD) ok = true;
+
+    if (!ok) {
+        fprintf(stderr,
+            "FATAL: illegal state transition tid=%u %u→%u\n",
+            tcb->tid, (unsigned)cur, (unsigned)new_state);
+        abort();
+    }
+    tcb->state = new_state;
+}
+
 /* 每个任务的 entry/arg，由 mk_task_create 填，mk_task_wrapper 取 */
 typedef struct {
     mk_task_entry_t entry;
@@ -57,6 +146,7 @@ void mk_task_init(void)
     memset(g_entries, 0, sizeof(g_entries));
     for (int i = 0; i < MK_MAX_TASKS; ++i) {
         g_tasks[i].tid = (uint8_t)i;
+        tcb_init_canary(&g_tasks[i]);
         g_tasks[i].state = MK_TASK_DEAD;
     }
     g_current   = MK_MAX_TASKS;
@@ -90,9 +180,10 @@ int mk_task_create(const char *name, mk_task_entry_t entry,
     }
 
     memset(tcb, 0, sizeof(*tcb));
+    tcb_init_canary(tcb);
     tcb->tid         = (uint8_t)tid;
     tcb->prio        = prio;
-    tcb->state       = MK_TASK_DEAD;   /* mk_sched_ready 里改成 READY */
+        mk_tcb_set_state(tcb, MK_TASK_DEAD);   /* mk_sched_ready 里改成 READY */
     tcb->stack       = stack;
     tcb->stack_size  = stack_size;
     tcb->wake_tick   = 0;
@@ -138,7 +229,7 @@ void mk_task_exit(void)
     mk_ipc_cleanup_dead_service(tid);
 
     /* 然后正常收尾 */
-    tcb->state = MK_TASK_DEAD;
+        mk_tcb_set_state(tcb, MK_TASK_DEAD);
     if (tcb->stack) {
         free(tcb->stack);
         tcb->stack = NULL;
@@ -167,7 +258,7 @@ void mk_task_sleep(uint64_t ticks)
     mk_tcb_t *tcb = &g_tasks[tid];
 
     tcb->wake_tick = mk_ticks + ticks;
-    tcb->state     = MK_TASK_SLEEPING;
+        mk_tcb_set_state(tcb, MK_TASK_SLEEPING);
     mk_sched_unready(tid);
 
     mk_sched_tick();
@@ -241,9 +332,14 @@ void mk_sched_tick(void)
     /* prev 如果是 RUNNING（正常 yield），状态转 READY；
      * 如果是 SLEEPING/BLOCKED（sleep/IPC 自己设的），不动 */
     if (prev != MK_MAX_TASKS && g_tasks[prev].state == MK_TASK_RUNNING) {
-        g_tasks[prev].state = MK_TASK_READY;
+        mk_tcb_set_state(&g_tasks[prev], MK_TASK_READY);
     }
-    g_tasks[next].state = MK_TASK_RUNNING;
+    mk_tcb_set_state(&g_tasks[next], MK_TASK_RUNNING);
+
+    /* 硬化：swapcontext 前必须过 canary + ctx 完整性 */
+    tcb_check_canary(&g_tasks[prev]);
+    tcb_check_canary(&g_tasks[next]);
+    tcb_check_ctx_integrity(&g_tasks[next]);
 
     g_current = next;
     swapcontext(&g_tasks[prev].ctx, &g_tasks[next].ctx);
@@ -264,7 +360,12 @@ void mk_sched_run(void)
             mk_sched_ready(first);
         }
 
-        g_tasks[first].state = MK_TASK_RUNNING;
+        mk_tcb_set_state(&g_tasks[first], MK_TASK_RUNNING);
+
+        /* 硬化：setcontext 前过 canary + ctx 完整性 */
+        tcb_check_canary(&g_tasks[first]);
+        tcb_check_ctx_integrity(&g_tasks[first]);
+
         g_current = first;
 
         /* 第一次跑，没有 prev 的 ctx 要 swap，直接 setcontext */

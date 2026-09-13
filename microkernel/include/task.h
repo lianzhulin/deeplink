@@ -13,8 +13,16 @@
 #include <ucontext.h>
 #include "kernel.h"
 
+/* ---- TCB 硬化：前后魔数 ----
+ * 两个魔数夹着整个 TCB，任何方向的野指针/栈溢出覆盖都会破坏其中一个。
+ * 调度器每 tick 检查一次，发现 mismatch 就 abort 而不是 silent corruption。 */
+#define MK_TCB_CANARY_HEAD  0xCAFEBABEDEADBEEFULL
+#define MK_TCB_CANARY_TAIL  0x0BADF00DCAFEFACEULL
+
 /* ---- TCB ---- */
 typedef struct mk_tcb {
+    uint64_t           canary_head;    /* 硬化：前魔数 */
+
     uint8_t            tid;
     uint8_t            prio;          /* 预留给后续扩展；当前调度器不使用 */
     volatile mk_task_state_t state;
@@ -43,6 +51,8 @@ typedef struct mk_tcb {
 
     /* 事件 bitmap（中断上半部置位，任务自己 poll） */
     volatile uint32_t  irq_pending;
+
+    uint64_t           canary_tail;    /* 硬化：后魔数 */
 } mk_tcb_t;
 
 /* ---- 任务入口函数签名 ---- */
@@ -72,6 +82,9 @@ void mk_task_sleep(uint64_t ticks);
 uint8_t mk_current_tid(void);
 mk_tcb_t *mk_current(void);
 mk_tcb_t *mk_tcb_get(uint8_t tid);
+
+/* 硬化：状态机 helper + canary 检查。所有 state 写必须走它。 */
+void    mk_tcb_set_state(mk_tcb_t *tcb, mk_task_state_t new_state);
 
 /* 调度器内部：把 tid 加/移出调度链 */
 void mk_sched_ready(uint8_t tid);

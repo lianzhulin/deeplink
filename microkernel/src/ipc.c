@@ -129,7 +129,7 @@ mk_err_t mk_ipc_send(uint8_t to, const mk_msg_t *msg)
 
     /* ---- 我 send 阻塞，等对方 reply 解 ---- */
     me->ipc_send_wait = true;
-    me->state         = MK_TASK_BLOCKED;
+        mk_tcb_set_state(me, MK_TASK_BLOCKED);
     mk_sched_unready(self);
     mk_sched_tick();
 
@@ -161,7 +161,7 @@ mk_err_t mk_ipc_receive(mk_msg_t *msg)
 
     while (q_empty(mbox)) {
         tcb->ipc_recv_wait = true;
-        tcb->state         = MK_TASK_BLOCKED;
+            mk_tcb_set_state(tcb, MK_TASK_BLOCKED);
         mk_sched_unready(tid);
         mk_sched_tick();
         /* 醒来后循环再看，防御假唤醒（虽然硬化版不会有） */
