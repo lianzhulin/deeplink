@@ -28,19 +28,18 @@ typedef struct mk_tcb {
     uint64_t           wake_tick;
 
     /* ---- IPC 硬化版阻塞状态 ----
-     * 三种独立的阻塞原因，精确隔离，互不污染：
+     * 两种独立的阻塞原因，精确隔离，互不污染：
      *
-     *   ipc_send_wait    = true: send() 投出了消息，等对方 reply 解
-     *   ipc_recv_wait    = true: receive() 队空阻塞，等 send/reply 投递解
-     *   ipc_space_wait   = true: send() 时对方队列满，等 receive 腾出槽解
+     *   ipc_send_wait = true: send() 投出了消息，等对方 reply 解
+     *   ipc_recv_wait = true: receive() 队空阻塞，等 send/reply 投递解
      *
-     * 每个任务同时最多只有一种阻塞，所以用三个独立 bool 即可。
-     * 唤醒时精确匹配：reply 只解 send_wait；send/reply 只解 recv_wait；
-     * receive 只解所有 space_wait。 */
+     * 为什么没有 space_wait（队列满阻塞）？
+     *   send 是同步的 → 每个任务同时最多 1 条 inflight send。
+     *   QUEUE_SIZE = MAX_TASKS → 一个 mailbox 最多积压 MAX_TASKS-1 条 send
+     *   （其他所有任务各 1 条），永远差 1 格。
+     *   背压是死代码，删。不变量：同步 send + N 槽 ≥ N-1 积压。 */
     volatile bool      ipc_send_wait;
     volatile bool      ipc_recv_wait;
-    volatile bool      ipc_space_wait;
-    uint8_t            space_wait_target;   /* space_wait 时等谁的 mailbox 空 */
 
     /* 事件 bitmap（中断上半部置位，任务自己 poll） */
     volatile uint32_t  irq_pending;

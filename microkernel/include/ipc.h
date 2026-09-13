@@ -1,12 +1,12 @@
 /*
  * ipc.h — IPC 三原语硬化版：send / receive / reply
  *
- * 硬化要点：
- *   - 队列满 → send 阻塞（背压），不丢消息
+ * 硬化要点（send 是同步的，QUEUE_SIZE = MAX_TASKS，队列永远不可能满，
+ * 所以没有背压阻塞——这个不变量由同步 send 语义保证）：
  *   - reply_id per slot：每条 send 入队时内核分配唯一 reply token；
  *     reply 必须携带匹配 token 才能解阻塞，否则返回 MK_ERR_INVALID
- *   - 三种独立阻塞原因：send_wait / recv_wait / space_wait
- *   - 单一真相源：inbox 空/满统一看 mbox.count，不再有 ipc_has_msg
+ *   - 两种独立阻塞原因：send_wait / recv_wait，精确隔离，零互相污染
+ *   - 单一真相源：inbox 空/满统一看 mbox.count，不再有 ipc_has_msg / ipc_blocked
  *
  * 消息体 = 24 字节：tag(2) + reply_id(2) + from(1) + flags(1) + pad(2) + data[4](16)。
  * 微内核哲学：IPC 传小消息，大消息走页共享。
@@ -41,11 +41,12 @@ typedef struct mk_msg {
 /* ---- 每个任务一个 mailbox：环形队列 + per-slot inflight ----
  *
  * MK_IPC_QUEUE_SIZE = MK_MAX_TASKS (32)：
- *   - 足够容纳所有其他任务同时 send 过来的极端情况
- *   - 队列永不溢出（send 阻塞等 receive 腾出槽 — 背压）
+ *   不变量：send 是同步的 → 每个任务同时最多 1 条 inflight send。
+ *   一个 mailbox 最多积压 MAX_TASKS-1 = 31 条（其他所有任务各 1 条）。
+ *   32 槽 ≥ 31 积压 → 队列永不溢出。不需要背压阻塞。
  *
  * 旧版单槽 reply_to 被拆成 per-slot 状态：
- *   inflight[slot]        = true 表示 slot 那条 send 还在等 reply
+ *   inflight[slot]         = true 表示 slot 那条 send 还在等 reply
  *   reply_id_of_slot[slot] = 那条 send 的 reply token
  *   reply 时 reply_id 必须匹配才能解 send 阻塞 */
 #define MK_IPC_QUEUE_SIZE MK_MAX_TASKS
