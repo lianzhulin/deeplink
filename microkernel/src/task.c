@@ -95,7 +95,6 @@ int mk_task_create(const char *name, mk_task_entry_t entry,
     tcb->stack       = stack;
     tcb->stack_size  = stack_size;
     tcb->wake_tick   = 0;
-    tcb->ipc_waiter  = (uint8_t)-1;
     strncpy(tcb->name, name ? name : "anon", sizeof(tcb->name) - 1);
 
     /* makecontext：entry 先存起来，wrapper 里调 */

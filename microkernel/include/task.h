@@ -27,10 +27,20 @@ typedef struct mk_tcb {
     /* 睡眠唤醒 tick（时钟任务会检查并把 sleeping -> ready） */
     uint64_t           wake_tick;
 
-    /* IPC 相关状态（ipc.c 自己填充，这里只预留） */
-    uint8_t            ipc_waiter;    /* 等谁 reply，或谁在等我 reply */
-    volatile bool      ipc_blocked;
-    volatile bool      ipc_has_msg;   /* 收件箱是否有未读消息 */
+    /* ---- IPC 硬化版阻塞状态 ----
+     * 三种独立的阻塞原因，精确隔离，互不污染：
+     *
+     *   ipc_send_wait    = true: send() 投出了消息，等对方 reply 解
+     *   ipc_recv_wait    = true: receive() 队空阻塞，等 send/reply 投递解
+     *   ipc_space_wait   = true: send() 时对方队列满，等 receive 腾出槽解
+     *
+     * 每个任务同时最多只有一种阻塞，所以用三个独立 bool 即可。
+     * 唤醒时精确匹配：reply 只解 send_wait；send/reply 只解 recv_wait；
+     * receive 只解所有 space_wait。 */
+    volatile bool      ipc_send_wait;
+    volatile bool      ipc_recv_wait;
+    volatile bool      ipc_space_wait;
+    uint8_t            space_wait_target;   /* space_wait 时等谁的 mailbox 空 */
 
     /* 事件 bitmap（中断上半部置位，任务自己 poll） */
     volatile uint32_t  irq_pending;

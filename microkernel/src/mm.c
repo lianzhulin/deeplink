@@ -123,6 +123,7 @@ static void mm_task(void *arg)
                   reply.data[0] = (int32_t)(v & 0xFFFFFFFF);
                   reply.data[1] = (int32_t)((v >> 32) & 0xFFFFFFFF);
                   reply.data[2] = 0;
+                  reply.reply_id = req.reply_id;
                   mk_ipc_reply(req.from, &reply);
                   break;
               }
@@ -134,6 +135,7 @@ static void mm_task(void *arg)
                   /* 必须 reply 解对方 send 的阻塞 —— send 现在是同步原语 */
                   reply.tag = MK_MM_TAG_FREE;
                   reply.data[0] = 0;
+                  reply.reply_id = req.reply_id;
                   mk_ipc_reply(req.from, &reply);
                   break;
               }
@@ -142,6 +144,7 @@ static void mm_task(void *arg)
                   reply.data[0] = MK_MM_ARENA_SIZE;
                   reply.data[1] = arena_total_used();
                   reply.data[2] = MK_MM_ARENA_SIZE - reply.data[1];
+                  reply.reply_id = req.reply_id;
                   mk_ipc_reply(req.from, &reply);
                   break;
               }
@@ -149,6 +152,7 @@ static void mm_task(void *arg)
                   /* 未知 tag 也要 reply 解阻塞，否则对端 send 永远挂着 */
                   reply.tag = req.tag;
                   reply.data[0] = -1;
+                  reply.reply_id = req.reply_id;
                   mk_ipc_reply(req.from, &reply);
                   break;
           }
