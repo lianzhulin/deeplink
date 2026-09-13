@@ -114,37 +114,44 @@ static void mm_task(void *arg)
         if (mk_ipc_receive(&req) != MK_OK) continue;
 
         switch (req.tag) {
-            case MK_MM_TAG_ALLOC: {
-                size_t sz = (size_t)req.data[0];
-                void *p = arena_alloc(sz);
-                reply.tag = MK_MM_TAG_ALLOC;
-                /* 把 64-bit 指针拆成两个 int32 存 */
-                uint64_t v = (uint64_t)(uintptr_t)p;
-                reply.data[0] = (int32_t)(v & 0xFFFFFFFF);
-                reply.data[1] = (int32_t)((v >> 32) & 0xFFFFFFFF);
-                reply.data[2] = 0;
-                mk_ipc_reply(req.from, &reply);
-                break;
-            }
-            case MK_MM_TAG_FREE: {
-                uint64_t v = (uint64_t)(uint32_t)req.data[0] |
-                             ((uint64_t)(uint32_t)req.data[1] << 32);
-                void *p = (void *)(uintptr_t)v;
-                arena_free(p);
-                break;
-            }
-            case MK_MM_TAG_QUERY: {
-                reply.tag = MK_MM_TAG_QUERY;
-                reply.data[0] = MK_MM_ARENA_SIZE;
-                reply.data[1] = arena_total_used();
-                reply.data[2] = MK_MM_ARENA_SIZE - reply.data[1];
-                mk_ipc_reply(req.from, &reply);
-                break;
-            }
-            default:
-                /* 未知 tag，丢弃 */
-                break;
-        }
+              case MK_MM_TAG_ALLOC: {
+                  size_t sz = (size_t)req.data[0];
+                  void *p = arena_alloc(sz);
+                  reply.tag = MK_MM_TAG_ALLOC;
+                  /* 把 64-bit 指针拆成两个 int32 存 */
+                  uint64_t v = (uint64_t)(uintptr_t)p;
+                  reply.data[0] = (int32_t)(v & 0xFFFFFFFF);
+                  reply.data[1] = (int32_t)((v >> 32) & 0xFFFFFFFF);
+                  reply.data[2] = 0;
+                  mk_ipc_reply(req.from, &reply);
+                  break;
+              }
+              case MK_MM_TAG_FREE: {
+                  uint64_t v = (uint64_t)(uint32_t)req.data[0] |
+                               ((uint64_t)(uint32_t)req.data[1] << 32);
+                  void *p = (void *)(uintptr_t)v;
+                  arena_free(p);
+                  /* 必须 reply 解对方 send 的阻塞 —— send 现在是同步原语 */
+                  reply.tag = MK_MM_TAG_FREE;
+                  reply.data[0] = 0;
+                  mk_ipc_reply(req.from, &reply);
+                  break;
+              }
+              case MK_MM_TAG_QUERY: {
+                  reply.tag = MK_MM_TAG_QUERY;
+                  reply.data[0] = MK_MM_ARENA_SIZE;
+                  reply.data[1] = arena_total_used();
+                  reply.data[2] = MK_MM_ARENA_SIZE - reply.data[1];
+                  mk_ipc_reply(req.from, &reply);
+                  break;
+              }
+              default:
+                  /* 未知 tag 也要 reply 解阻塞，否则对端 send 永远挂着 */
+                  reply.tag = req.tag;
+                  reply.data[0] = -1;
+                  mk_ipc_reply(req.from, &reply);
+                  break;
+          }
     }
 }
 
@@ -180,14 +187,16 @@ void mk_free(void *ptr)
         arena_free(ptr);
         return;
     }
-    mk_msg_t req;
+    mk_msg_t req, dummy;
     req.tag = MK_MM_TAG_FREE;
     uint64_t v = (uint64_t)(uintptr_t)ptr;
     req.data[0] = (int32_t)(v & 0xFFFFFFFF);
     req.data[1] = (int32_t)((v >> 32) & 0xFFFFFFFF);
+    /* send 同步阻塞 → mm 收到 FREE 后 reply ack → send 被唤醒返回。
+     * 但 reply 消息在我的 inbox 队列里，必须 receive 清走，
+     * 否则下次 send 时 inbox 满会让 reply 里触发 q_pop(NULL) 崩。 */
     mk_ipc_send(MK_TID_MM, &req);
-    /* free 不需要 reply（当前设计里 reply 只是给 alloc 用） */
-    (void)mk_ipc_poll;
+    mk_ipc_receive(&dummy);
 }
 
 mk_err_t mk_mm_query(int32_t out_buf[3])

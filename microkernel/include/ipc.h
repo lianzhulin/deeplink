@@ -22,11 +22,19 @@ typedef struct mk_msg {
     int32_t  data[MK_IPC_MSG_WORDS];
 } mk_msg_t;
 
-/* ---- 每个任务一个 mailbox（极简化：一槽 + 一个 reply waiter） ---- */
+/* ---- 每个任务一个 mailbox：4 槽环形队列 + 一个 reply waiter ----
+ *
+ * 环形队列解决多生产者同时 send 覆盖单槽的问题。
+ * 队列满时 send 会阻塞自己（等 receive 空出槽位）。
+ */
+#define MK_IPC_QUEUE_SIZE 4
+
 typedef struct {
-    mk_msg_t   inbox;           /* send 者写入这里；receive 者读出 */
-    bool       inbox_has;
-    int16_t    reply_to;        /* 当前任务阻塞在 reply 上时等待谁（-1 表示空闲） */
+    mk_msg_t   slots[MK_IPC_QUEUE_SIZE];
+    uint8_t    head;       /* 下一个 receive 的位置 */
+    uint8_t    tail;       /* 下一个 send 写入的位置 */
+    uint8_t    count;      /* 当前有多少条消息在队列里 */
+    int16_t    reply_to;   /* 最近一个 send 者的 tid（它在等我 reply）；-1 空闲 */
 } mk_mailbox_t;
 
 /* ---- API ---- */
