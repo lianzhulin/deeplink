@@ -2,9 +2,10 @@
  * task.h — 任务控制块 & 调度器
  *
  * 设计要点：
- *   - 环形单向链表调度，O(1) 切换
- *   - 切换时只 swapcontext，开销 = 一次寄存器保存 + 一次寄存器恢复
- *   - 空闲任务 idler 永远 READY，保证调度器不空
+ *   - bitmask 就绪集：g_ready_mask 的 bit i = 1 表示 tid=i 在 READY 集
+ *     入队/出队 = 一条位操作指令；选下一个 = tzcnt 硬件指令
+ *   - 切换时只 swapcontext，开销 = 一次寄存器保存 + 一次恢复
+ *   - 空闲任务 idler (tid=0) 永远在 mask 里，保证调度器不空
  */
 #ifndef MK_TASK_H
 #define MK_TASK_H
@@ -22,9 +23,6 @@ typedef struct mk_tcb {
     ucontext_t         ctx;           /* 寄存器上下文 + 栈 */
     void              *stack;
     size_t             stack_size;
-
-    /* 环形调度链 */
-    uint8_t            next;          /* 下一个 ready 任务的 tid */
 
     /* 睡眠唤醒 tick（时钟任务会检查并把 sleeping -> ready） */
     uint64_t           wake_tick;
