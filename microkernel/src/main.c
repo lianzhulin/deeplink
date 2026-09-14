@@ -104,18 +104,43 @@ static void demo_task_b(void *arg)
     mk_task_exit();
 }
 
-/* ---- echo_task：IPC 往返测试 ---- */
+/* ---- echo_task：IPC 往返测试 + benchmark ---- */
 static void echo_task(void *arg)
 {
     (void)arg;
-    printf("[echo] started\n");
+    printf("[echo] IPC bench (5000 round trips)...\n");
 
     mk_msg_t msg, reply;
     msg.tag = MK_MM_TAG_QUERY;
+
+    /* warmup 100 次 */
+    for (int i = 0; i < 100; ++i) {
+        mk_ipc_send(MK_TID_MM, &msg);
+        mk_ipc_receive(&reply);
+    }
+
+    /* 正式计时 */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const int N = 5000;
+    for (int i = 0; i < N; ++i) {
+        mk_ipc_send(MK_TID_MM, &msg);
+        mk_ipc_receive(&reply);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t total_ns  = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                       + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
+    uint64_t avg_ns    = total_ns / N;
+    double   cycles    = (double)avg_ns * 3.0;
+
+    printf("[echo] IPC bench result: %lu ns/round-trip (~%.0f cycles @3GHz)\n",
+           avg_ns, cycles);
+    printf("[echo] total: %lu ns for %d rounds\n", total_ns, N);
+
+    /* 一次正常 query + 退出 */
     mk_ipc_send(MK_TID_MM, &msg);
     mk_ipc_receive(&reply);
     printf("[echo] mm reply: tag=0x%04X total=%d\n", reply.tag, reply.data[0]);
-
     printf("[echo] done, exiting\n");
     mk_task_exit();
 }

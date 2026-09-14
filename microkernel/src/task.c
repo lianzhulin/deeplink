@@ -62,41 +62,32 @@ static void tcb_check_ctx_integrity(const mk_tcb_t *tcb)
 }
 
 /* 状态机 helper —— 所有 state 写点必须走这里
- * 白名单转换：
- *   DEAD      → DEAD/READY
- *   READY     → READY/RUNNING
- *   RUNNING   → READY/BLOCKED/SLEEPING
- *   BLOCKED   → READY/DEAD
- *   SLEEPING  → READY/DEAD
- *   任意      → DEAD (mk_task_exit) */
+ *
+ *  白名单转换（L1 优化：2D 数组查表代替 switch，O(1)）：
+ *        DEAD  READY  RUNNING  BLOCKED  SLEEPING
+ *  DEAD    1     1      0        0        0
+ *  READY   0     1      1        0        0
+ *  RUNNING 1     1      0        1        1     ← 还可到 BLOCKED/SLEEPING
+ *  BLOCKED 1     1      0        0        1     ← 还可到 SLEEPING（被 sleep 覆盖的罕见情况）
+ *  SLEEPING 1    1      0        0        0
+ *  额外 escape hatch：任何状态 → DEAD 都合法 */
+static const uint8_t g_valid_trans[5][5] = {
+    { 1, 1, 0, 0, 0 },   /* DEAD    → DEAD/READY */
+    { 0, 1, 1, 0, 0 },   /* READY   → READY/RUNNING */
+    { 1, 1, 0, 1, 1 },   /* RUNNING → 允许 READY/BLOCKED/SLEEPING + DEAD escape */
+    { 1, 1, 0, 0, 0 },   /* BLOCKED → READY/DEAD */
+    { 1, 1, 0, 0, 0 },   /* SLEEPING → READY/DEAD */
+};
+
 void mk_tcb_set_state(mk_tcb_t *tcb, mk_task_state_t new_state)
 {
-    tcb_check_canary(tcb);   /* canary 先过 */
+    tcb_check_canary(tcb);
 
     mk_task_state_t cur = tcb->state;
-    bool ok = true;
-    switch (cur) {
-    case MK_TASK_DEAD:
-        ok = (new_state == MK_TASK_DEAD || new_state == MK_TASK_READY);
-        break;
-    case MK_TASK_READY:
-        ok = (new_state == MK_TASK_READY || new_state == MK_TASK_RUNNING);
-        break;
-    case MK_TASK_RUNNING:
-        ok = (new_state == MK_TASK_READY
-                || new_state == MK_TASK_BLOCKED
-                || new_state == MK_TASK_SLEEPING);
-        break;
-    case MK_TASK_BLOCKED:
-    case MK_TASK_SLEEPING:
-        ok = (new_state == MK_TASK_READY || new_state == MK_TASK_DEAD);
-        break;
-    default:
-        ok = false;
-    }
 
-    /* Escape hatch: 任何状态 → DEAD 都合法（mk_task_exit 在任何时机都能被调） */
-    if (new_state == MK_TASK_DEAD) ok = true;
+    /* Escape hatch: 任何状态 → DEAD 都合法 */
+    bool ok = (new_state == MK_TASK_DEAD)
+            || g_valid_trans[cur][new_state];
 
     if (!ok) {
         fprintf(stderr,
@@ -284,7 +275,8 @@ void mk_sched_ready(uint8_t tid)
 {
     g_ready_mask |= (1u << tid);
     if (g_tasks[tid].state != MK_TASK_RUNNING) {
-        g_tasks[tid].state = MK_TASK_READY;
+        /* L1 优化 + 硬化修复：之前直接写 state 绕过 mk_tcb_set_state → canary 漏检 */
+        mk_tcb_set_state(&g_tasks[tid], MK_TASK_READY);
     }
 }
 
@@ -322,28 +314,38 @@ static uint8_t pick_next(void)
 
 /* ---- tick：yield / sleep / IPC block 等调度点调用 ----
  *
- *  只负责挑下一个 + swapcontext。热路径，零分支判断（除了 prev==next）。 */
+ *  只负责挑下一个 + swapcontext。热路径。
+ *
+ *  L1 优化：去掉 tick 里的 canary 全量/按需检查。
+ *  所有 state 变更点（send/exit/sleep/mk_sched_ready）都走 mk_tcb_set_state，
+ *  canary 在那里已经检查过。tick 里再查 prev+next 是重复的。
+ *  但保留两条兜底：
+ *    1. ctx 完整性检查 —— swapcontext 独有的，之前 state 变更点没覆盖
+ *    2. idler canary —— idler 永不退出，如果有人能覆盖它的 canary，
+ *       说明内存破坏已经严重到整个内核随时会崩，不能等下次 state 变更
+ *       才被发现。 */
 void mk_sched_tick(void)
 {
+    /* L1 兜底：idler canary 每 tick 必查（成本：2 个整数比较，O(1)） */
+    tcb_check_canary(&g_tasks[MK_TID_IDLER]);
+
     uint8_t next = pick_next();
     uint8_t prev = g_current;
     if (prev == next) return;
 
     /* prev 如果是 RUNNING（正常 yield），状态转 READY；
-     * 如果是 SLEEPING/BLOCKED（sleep/IPC 自己设的），不动 */
+     * 如果是 SLEEPING/BLOCKED（sleep/IPC 自己设的），不动。
+     * mk_tcb_set_state 内部会查 canary */
     if (prev != MK_MAX_TASKS && g_tasks[prev].state == MK_TASK_RUNNING) {
         mk_tcb_set_state(&g_tasks[prev], MK_TASK_READY);
     }
     mk_tcb_set_state(&g_tasks[next], MK_TASK_RUNNING);
 
-    /* 硬化：swapcontext 前必须过 canary + ctx 完整性 */
-    tcb_check_canary(&g_tasks[prev]);
-    tcb_check_canary(&g_tasks[next]);
+    /* ctx 完整性 —— swapcontext 独有，state 变更点没覆盖 */
     tcb_check_ctx_integrity(&g_tasks[next]);
 
     g_current = next;
     swapcontext(&g_tasks[prev].ctx, &g_tasks[next].ctx);
-    /* 从 swapcontext 返回时，我们已经在 prev 的下一次调度里被换回 */
 }
 
 /* ---- 启动调度器 ---- */

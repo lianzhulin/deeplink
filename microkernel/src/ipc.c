@@ -47,21 +47,22 @@ void mk_ipc_init(void)
  * ================================================================ */
 static inline bool q_empty(const mk_mailbox_t *m) { return m->count == 0; }
 
-static uint8_t q_push(mk_mailbox_t *m, const mk_msg_t *msg)
+/* L1 优化：static inline + 位与代替模（QUEUE_SIZE=32=2^5 → mask=31）
+ * 编译器 -O2 可能已经自动做了，但显式写出来防止退化 */
+static inline uint8_t q_push(mk_mailbox_t *m, const mk_msg_t *msg)
 {
-    /* 不变量：同步 send + QUEUE_SIZE = N → count 永远 < N */
     uint8_t slot = m->tail;
     m->slots[slot] = *msg;
-    m->tail = (m->tail + 1) % MK_IPC_QUEUE_SIZE;
+    m->tail = (uint8_t)((slot + 1) & (MK_IPC_QUEUE_SIZE - 1));
     m->count++;
     return slot;
 }
 
-static uint8_t q_pop(mk_mailbox_t *m, mk_msg_t *out)
+static inline uint8_t q_pop(mk_mailbox_t *m, mk_msg_t *out)
 {
     uint8_t slot = m->head;
     if (out) *out = m->slots[slot];
-    m->head = (m->head + 1) % MK_IPC_QUEUE_SIZE;
+    m->head = (uint8_t)((slot + 1) & (MK_IPC_QUEUE_SIZE - 1));
     m->count--;
     return slot;
 }
@@ -70,8 +71,10 @@ static uint8_t q_pop(mk_mailbox_t *m, mk_msg_t *out)
  *  两种精确唤醒 —— 每种只解对应的那一种阻塞
  * ================================================================ */
 
+/* L1 优化：加 static inline，省函数调用开销 */
+
 /* 解 "send 阻塞等 reply" —— 只有 reply() 能调 */
-static void wake_send_waiter(uint8_t tid)
+static inline void wake_send_waiter(uint8_t tid)
 {
     mk_tcb_t *tcb = mk_tcb_get(tid);
     if (tcb->ipc_send_wait && tcb->state == MK_TASK_BLOCKED) {
@@ -81,7 +84,7 @@ static void wake_send_waiter(uint8_t tid)
 }
 
 /* 解 "receive 阻塞等消息" —— send() 或 reply() 投递消息时调 */
-static void wake_recv_waiter(uint8_t tid)
+static inline void wake_recv_waiter(uint8_t tid)
 {
     mk_tcb_t *tcb = mk_tcb_get(tid);
     if (tcb->ipc_recv_wait && tcb->state == MK_TASK_BLOCKED) {
