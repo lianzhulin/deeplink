@@ -130,4 +130,8 @@ void mk_sched_tick(void);
 /* 启动调度器，从 idler 开始跑。永不返回。 */
 void mk_sched_run(void) __attribute__((noreturn));
 
+/* ── tick 内部 cycle 剖析（debug 用） ── */
+void mk_tick_prof_reset(void);
+void mk_tick_prof_dump(void);
+
 #endif /* MK_TASK_H */
