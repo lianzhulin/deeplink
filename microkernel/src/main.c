@@ -119,7 +119,9 @@ static void echo_task(void *arg)
         mk_ipc_receive(&reply);
     }
 
-    /* 正式计时 */
+    /* 重置 profiler，正式计时 */
+    mk_ipc_prof_reset();
+
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     const int N = 5000;
@@ -128,6 +130,9 @@ static void echo_task(void *arg)
         mk_ipc_receive(&reply);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    /* dump 逐阶段 breakdown */
+    mk_ipc_prof_dump(N);
     uint64_t total_ns  = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL
                        + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
     uint64_t avg_ns    = total_ns / N;
