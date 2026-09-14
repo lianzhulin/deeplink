@@ -1,11 +1,12 @@
 /*
  * task.c — TCB 数组、上下文切换、bitmask 调度器
  *
- * 切换开销 = swapcontext() 一次（寄存器保存 + 恢复）
+ * L2 轻量上下文：mk_ctx_swap/mk_ctx_load/mk_ctx_init（汇编原语）
+ *   - 只保存 callee-saved 6 个寄存器 + rsp = 56B
+ *   - 对比 glibc swapcontext：省掉 FPU/SSE 状态、signal mask 等
  * 调度开销 = 入队/出队 一条位指令；选下一个 = tzcnt 硬件指令（x86-64）
  */
 #define _GNU_SOURCE
-#include <ucontext.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -42,21 +43,33 @@ static void tcb_check_canary(const mk_tcb_t *tcb)
     }
 }
 
-/* ctx/stack 完整性 —— swapcontext 前调 */
+/* ctx/stack 完整性 —— 切换前调
+ *
+ * L2：轻量 ctx 只存 rsp。我们验证 rsp 落在 [stack, stack + stack_size) 范围内。
+ * 这样能抓到：栈指针野飞、栈被 free 后 ctx 没清等情况。
+ *
+ * 注意：新创建的任务 ctx 也会过这里 —— mk_ctx_init 把 rsp 设到栈顶附近，
+ * 一定在范围内。已运行过的任务 save 下来的 rsp 也指向自己栈上某处，
+ * 同样在范围内。只有内存破坏或 use-after-free 才会让它越界。 */
 static void tcb_check_ctx_integrity(const mk_tcb_t *tcb)
 {
-    if (tcb->ctx.uc_stack.ss_sp   != tcb->stack
-            || tcb->ctx.uc_stack.ss_size != tcb->stack_size
-            || tcb->ctx.uc_link  != NULL) {
+    if (!tcb->stack || tcb->stack_size == 0) {
         fprintf(stderr,
-            "FATAL: TCB ctx integrity fail tid=%u "
-            "ctx.ss_sp=%p tcb.stack=%p "
-            "ctx.ss_size=%zu tcb.stack_size=%zu "
-            "ctx.uc_link=%p (expect NULL)\n",
-            tcb->tid,
-            tcb->ctx.uc_stack.ss_sp, tcb->stack,
-            tcb->ctx.uc_stack.ss_size, tcb->stack_size,
-            tcb->ctx.uc_link);
+            "FATAL: TCB ctx integrity fail tid=%u stack=NULL or size=0\n",
+            tcb->tid);
+        abort();
+    }
+
+    uintptr_t rsp   = (uintptr_t)tcb->ctx.rsp;
+    uintptr_t sbase = (uintptr_t)tcb->stack;
+    uintptr_t stop  = sbase + tcb->stack_size;
+
+    if (rsp < sbase || rsp >= stop) {
+        fprintf(stderr,
+            "FATAL: TCB ctx rsp out of stack tid=%u "
+            "ctx.rsp=0x%lx stack=[0x%lx, 0x%lx)\n",
+            tcb->tid, (unsigned long)rsp,
+            (unsigned long)sbase, (unsigned long)stop);
         abort();
     }
 }
@@ -111,10 +124,9 @@ static uint32_t    g_ready_mask = 0;              /* bit i=1 表示 tid=i 在 RE
 
 volatile uint64_t mk_ticks = 0;
 
-/* ---- trampoline：被 makecontext 调起 ----
- * 调度器在 swapcontext 前已经把 g_current 设成 next 的 tid，
- * 所以 wrapper 里直接 mk_current_tid() 就能拿到自己的 tid。
- * 完全不依赖 makecontext 的参数传递。 */
+/* ---- trampoline：mk_ctx_init 把 mk_task_wrapper 作为 entry 压入栈 ----
+ * 调度器在 mk_ctx_swap 前已经把 g_current 设成 next 的 tid，
+ * 所以 wrapper 里直接 mk_current_tid() 就能拿到自己的 tid。 */
 static void mk_task_wrapper(void)
 {
     int tid = (int)mk_current_tid();
@@ -180,16 +192,15 @@ int mk_task_create(const char *name, mk_task_entry_t entry,
     tcb->wake_tick   = 0;
     strncpy(tcb->name, name ? name : "anon", sizeof(tcb->name) - 1);
 
-    /* makecontext：entry 先存起来，wrapper 里调 */
+    /* entry/arg 先存起来，wrapper 运行时从 g_entries[tid] 取 */
     g_entries[tid].entry = entry;
     g_entries[tid].arg   = arg;
 
-    getcontext(&tcb->ctx);
-    tcb->ctx.uc_stack.ss_sp   = stack;
-    tcb->ctx.uc_stack.ss_size = stack_size;
-    tcb->ctx.uc_link          = NULL;
-
-    makecontext(&tcb->ctx, (void (*)(void))mk_task_wrapper, 0);
+    /* L2: mk_ctx_init 一次性搞定 —— 清零 callee-saved 寄存器，
+     * 栈顶压入 mk_task_wrapper 作为 return address，
+     * rsp 指向栈顶。比 getcontext+makecontext 省几百字节。 */
+    mk_ctx_init(&tcb->ctx, (void (*)(void))mk_task_wrapper,
+                stack, stack_size);
 
     /* 置 READY 位 + 改 state */
     mk_sched_ready((uint8_t)tid);
@@ -345,7 +356,7 @@ void mk_sched_tick(void)
     tcb_check_ctx_integrity(&g_tasks[next]);
 
     g_current = next;
-    swapcontext(&g_tasks[prev].ctx, &g_tasks[next].ctx);
+    mk_ctx_swap(&g_tasks[prev].ctx, &g_tasks[next].ctx);
 }
 
 /* ---- 启动调度器 ---- */
@@ -364,14 +375,14 @@ void mk_sched_run(void)
 
         mk_tcb_set_state(&g_tasks[first], MK_TASK_RUNNING);
 
-        /* 硬化：setcontext 前过 canary + ctx 完整性 */
+        /* 硬化：mk_ctx_load 前过 canary + ctx 完整性 */
         tcb_check_canary(&g_tasks[first]);
         tcb_check_ctx_integrity(&g_tasks[first]);
 
         g_current = first;
 
-        /* 第一次跑，没有 prev 的 ctx 要 swap，直接 setcontext */
-        setcontext(&g_tasks[first].ctx);
+        /* 第一次跑，没有 prev 的 ctx 要 swap，直接 mk_ctx_load 跳进去 */
+        mk_ctx_load(&g_tasks[first].ctx);
         abort();
     }
     mk_sched_tick();

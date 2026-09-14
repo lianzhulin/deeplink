@@ -4,14 +4,32 @@
  * 设计要点：
  *   - bitmask 就绪集：g_ready_mask 的 bit i = 1 表示 tid=i 在 READY 集
  *     入队/出队 = 一条位操作指令；选下一个 = tzcnt 硬件指令
- *   - 切换时只 swapcontext，开销 = 一次寄存器保存 + 一次恢复
+ *   - L2 轻量上下文：mk_light_ctx_t 只有 56B（callee-saved 6 个寄存器 + rsp），
+ *     对比 glibc ucontext_t 的 968B —— 省掉 FPU/SSE 状态、signal mask、
+ *     uc_link/uc_stack 等内核根本不关心的字段
  *   - 空闲任务 idler (tid=0) 永远在 mask 里，保证调度器不空
  */
 #ifndef MK_TASK_H
 #define MK_TASK_H
 
-#include <ucontext.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include "kernel.h"
+
+/* ---- L2: 轻量上下文（x86-64） ----
+ *
+ * SysV ABI callee-saved 寄存器：rbx, rbp, r12, r13, r14, r15
+ * 加上 rsp。返回地址通过 ret 指令从栈弹出，不单独存。
+ * 合计 7 × 8 = 56 字节。 */
+typedef struct mk_light_ctx {
+    uint64_t rbx;
+    uint64_t rbp;
+    uint64_t r12;
+    uint64_t r13;
+    uint64_t r14;
+    uint64_t r15;
+    uint64_t rsp;
+} mk_light_ctx_t;
 
 /* ---- TCB 硬化：前后魔数 ----
  * 两个魔数夹着整个 TCB，任何方向的野指针/栈溢出覆盖都会破坏其中一个。
@@ -28,7 +46,7 @@ typedef struct mk_tcb {
     volatile mk_task_state_t state;
     char               name[16];
 
-    ucontext_t         ctx;           /* 寄存器上下文 + 栈 */
+    mk_light_ctx_t     ctx;           /* L2: 56B 轻量寄存器上下文 */
     void              *stack;
     size_t             stack_size;
 
@@ -85,6 +103,22 @@ mk_tcb_t *mk_tcb_get(uint8_t tid);
 
 /* 硬化：状态机 helper + canary 检查。所有 state 写必须走它。 */
 void    mk_tcb_set_state(mk_tcb_t *tcb, mk_task_state_t new_state);
+
+/* ---- L2: 轻量上下文原语（汇编实现） ---- */
+
+/* 初始化一个新上下文：entry 是任务入口函数，
+ * stack + stack_size 是栈内存（调用者已分配好）。
+ * 把 entry 压入栈作为 return address，callee-saved 寄存器清零。 */
+void mk_ctx_init(mk_light_ctx_t *ctx, void (*entry)(void),
+                 void *stack, size_t stack_size);
+
+/* 切换上下文：保存当前到 old，恢复并跳转到 new。
+ * 相当于 swapcontext(old, new)。 */
+void mk_ctx_swap(mk_light_ctx_t *old_ctx, mk_light_ctx_t *new_ctx);
+
+/* 加载并跳转到 ctx。只恢复不保存。
+ * 相当于 setcontext(ctx)。 */
+void mk_ctx_load(mk_light_ctx_t *ctx);
 
 /* 调度器内部：把 tid 加/移出调度链 */
 void mk_sched_ready(uint8_t tid);

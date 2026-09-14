@@ -10,7 +10,9 @@ OBJ_DIR = build
 BIN_DIR = bin
 
 SOURCES = $(wildcard $(SRC_DIR)/*.c)
-OBJECTS = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
+ASM     = $(wildcard $(SRC_DIR)/*.S)
+OBJECTS = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SOURCES)) \
+          $(patsubst $(SRC_DIR)/%.S,$(OBJ_DIR)/%.o,$(ASM))
 TARGET  = $(BIN_DIR)/mk
 
 .PHONY: all clean run
@@ -21,6 +23,9 @@ $(TARGET): $(OBJECTS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.S | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(OBJ_DIR):
