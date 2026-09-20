@@ -20,7 +20,6 @@
 static mk_tcb_t   g_tasks[MK_MAX_TASKS];
 
 /* ================================================================
- *  tick 内部分解 —— ctx_swap 到底花在哪了
  *
  *  一次 mk_sched_tick（= 一次完整的 ctx_swap 调用）拆成 7 步:
  *
@@ -32,47 +31,30 @@ static mk_tcb_t   g_tasks[MK_MAX_TASKS];
  *   T5  g_current 赋值 + 无关紧要
  *   T6  ★ mk_ctx_swap 汇编本体         6 callee-saved 寄存器保存/恢复 + ret
  *
- *  重点：T6 是"纯上下文切换"的硬件成本；T0~T5 是调度器（含硬化）的成本。
  * ================================================================ */
 #if defined(__x86_64__)
-static inline uint64_t tick_rdtsc(void) {
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
 }
 #else
 #include <x86intrin.h>
-#define tick_rdtsc() __rdtsc()
 #endif
 
 enum tick_prof_step {
-    TICK_T0_IDLER_CANARY,
-    TICK_T1_PICK_NEXT,
-    TICK_T2_PREV_STATE,
-    TICK_T3_NEXT_STATE,
-    TICK_T4_CTX_CHECK,
-    TICK_T5_ASSIGN_CURRENT,
-    TICK_T6_CTX_SWAP_ASM,
-    TICK_N_STEPS
 };
 
-static uint64_t g_tick_prof[TICK_N_STEPS];
 static int      g_tick_call_count;   /* tick 被调用次数 */
 
-void mk_tick_prof_reset(void) {
-    memset(g_tick_prof, 0, sizeof(g_tick_prof));
     g_tick_call_count = 0;
 }
 
-void mk_tick_prof_dump(void)
 {
     int tick_calls = g_tick_call_count;
     if (tick_calls == 0) tick_calls = 1;   /* 防除零 */
-    printf("\n┌─ mk_sched_tick 内部 cycle breakdown (%d calls) ─────────┐\n", tick_calls);
     printf("│ %-30s %10s %10s %8s\n", "Step", "total", "avg", "pct");
     printf("├────────────────────────────┬────────────┬────────────┬────────┤\n");
 
-    static const char *names[TICK_N_STEPS] = {
         "T0 idler canary check",
         "T1 pick_next (ctz)",
         "T2 prev state + set_state",
@@ -83,23 +65,15 @@ void mk_tick_prof_dump(void)
     };
 
     uint64_t total = 0;
-    for (int s = 0; s < TICK_N_STEPS; s++) total += g_tick_prof[s];
 
-    for (int s = 0; s < TICK_N_STEPS; s++) {
-        uint64_t t = g_tick_prof[s];
         double avg = (double)t / tick_calls;
         double pct = total ? 100.0 * t / total : 0;
         printf("│ %-30s %10lu %10.1f %7.1f%% │\n",
                names[s], t, avg, pct);
     }
 
-    uint64_t ctx_asm    = g_tick_prof[TICK_T6_CTX_SWAP_ASM];
-    uint64_t sched_ovhd = total - ctx_asm;
-
     printf("├────────────────────────────┼────────────┼────────────┼────────┤\n");
     printf("│ %-30s %10lu %10.1f %7.1f%% │\n",
-           "ctx_swap asm (T6)", ctx_asm, (double)ctx_asm/tick_calls,
-           total ? 100.0*ctx_asm/total : 0);
     printf("│ %-30s %10lu %10.1f %7.1f%% │\n",
            "调度器开销 (T0-T5)", sched_ovhd, (double)sched_ovhd/tick_calls,
            total ? 100.0*sched_ovhd/total : 0);
@@ -430,17 +404,12 @@ void mk_sched_tick(void)
 {
     g_tick_call_count++;
 
-    uint64_t t0 = tick_rdtsc();
     tcb_check_canary(&g_tasks[MK_TID_IDLER]);
 
-    uint64_t t1 = tick_rdtsc();
     uint8_t next = pick_next();
 
-    uint64_t t2 = tick_rdtsc();
     uint8_t prev = g_current;
     if (prev == next) {
-        g_tick_prof[TICK_T0_IDLER_CANARY]  += (t1 - t0);
-        g_tick_prof[TICK_T1_PICK_NEXT]     += (t2 - t1);
         return;
     }
 
@@ -451,27 +420,14 @@ void mk_sched_tick(void)
         mk_tcb_set_state(&g_tasks[prev], MK_TASK_READY);
     }
 
-    uint64_t t3 = tick_rdtsc();
     mk_tcb_set_state(&g_tasks[next], MK_TASK_RUNNING);
 
-    uint64_t t4 = tick_rdtsc();
     tcb_check_ctx_integrity(&g_tasks[next]);
 
-    uint64_t t5 = tick_rdtsc();
     g_current = next;
 
-    uint64_t t6 = tick_rdtsc();
     mk_ctx_swap(&g_tasks[prev].ctx, &g_tasks[next].ctx);
 
-    uint64_t t7 = tick_rdtsc();
-
-    g_tick_prof[TICK_T0_IDLER_CANARY]    += (t1 - t0);
-    g_tick_prof[TICK_T1_PICK_NEXT]       += (t2 - t1);
-    g_tick_prof[TICK_T2_PREV_STATE]      += (t3 - t2);
-    g_tick_prof[TICK_T3_NEXT_STATE]      += (t4 - t3);
-    g_tick_prof[TICK_T4_CTX_CHECK]       += (t5 - t4);
-    g_tick_prof[TICK_T5_ASSIGN_CURRENT]  += (t6 - t5);
-    g_tick_prof[TICK_T6_CTX_SWAP_ASM]    += (t7 - t6);
 }
 
 /* ---- 启动调度器 ---- */

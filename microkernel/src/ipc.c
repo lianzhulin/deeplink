@@ -28,129 +28,6 @@
 #include "task.h"
 #include "ipc.h"
 
-/* ================================================================
- *  IPC 逐阶段 cycle 剖析
- *
- *  一次 round-trip (echo → mm → echo) 拆成 11 个阶段 + 2 次 ctx_swap:
- *
- *  ┌─ echo.mk_ipc_send ──────────────────────────────────────────┐
- *  │ S1  token分配+内核写from/reply_id                              │
- *  │ S2  q_push 入队                                                │
- *  │ S3  wake_recv_waiter(mm)                                      │
- *  │ S4  设置 send_wait + state=BLOCKED + unready                   │
- *  │ S5  mk_sched_tick: ctx_swap→mm   ← 第一次上下文切换 (大项)      │
- *  └───────────────────────────────────────────────────────────────┘
- *  ┌─ mm.mk_ipc_receive ─────────────────────────────────────────┐
- *  │ S6  q_pop 取消息（已被 wake 解阻塞）                            │
- *  └───────────────────────────────────────────────────────────────┘
- *  ┌─ mm.mk_ipc_reply ────────────────────────────────────────────┐
- *  │ S7  扫 inflight 匹配 reply_id                                   │
- *  │ S8  reply q_push 入队 echo inbox                                │
- *  │ S9  wake_send_waiter(echo)                                      │
- *  └───────────────────────────────────────────────────────────────┘
- *  ┌─ mm.mk_ipc_receive (while循环再来) ─────────────────────────┐
- *  │ S10 队空→recv_wait+BLOCKED+tick→ctx_swap→echo ← 第二次切换      │
- *  └───────────────────────────────────────────────────────────────┘
- *  ┌─ echo 返回 ─────────────────────────────────────────────────┐
- *  │ S11 mk_ipc_receive.q_pop 取 reply（不阻塞）                     │
- *  └───────────────────────────────────────────────────────────────┘
- *
- *  统计方式：每个阶段累计 N 次 round-trip 的总 cycles，
- *  benchmark 结束后打印每阶段 avg + 占比。
- *
- *  profiling 通过 g_ipc_prof 全局累加，是轻量级的 rdtsc 打点
- *  —— 每个阶段只多 2 条指令（rdtsc + 加法），对结果影响很小。
- * ================================================================ */
-
-#if defined(__x86_64__)
-static inline uint64_t rdtsc(void) {
-    uint32_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((uint64_t)hi << 32) | lo;
-}
-#else
-#include <x86intrin.h>
-#define rdtsc() __rdtsc()
-#endif
-
-enum prof_step {
-    PROF_S1_SEND_PREP,        /* token + 内核写字段 + inflight 登记 */
-    PROF_S2_Q_PUSH,           /* q_push 入队 */
-    PROF_S3_WAKE_RECV,        /* wake_recv_waiter */
-    PROF_S4_BLOCK_SELF,       /* send_wait + BLOCKED + unready */
-    PROF_S5_TICK_OUT,         /* mk_sched_tick → 切走 (含 ctx_swap) */
-    PROF_S6_Q_POP,            /* q_pop x2：mm 取请求 + echo 取 reply (非阻塞) */
-    PROF_S7_MATCH_INFLIGHT,   /* reply 扫 inflight 匹配 reply_id */
-    PROF_S8_Q_PUSH_REPLY,     /* reply q_push 入队 echo inbox */
-    PROF_S9_WAKE_SEND,        /* wake_send_waiter(echo) */
-    PROF_S10_TICK_IN,         /* mm 第二次 receive 阻塞 + tick → 切回 echo */
-    PROF_N_STEPS
-};
-
-static uint64_t g_ipc_prof[PROF_N_STEPS];   /* 累计 cycles */
-static int      g_ipc_prof_count;            /* round-trip 次数 */
-
-/* 宏：测 [t0, t1) 期间的 cycles 加到 g_ipc_prof[step] */
-#define PROF_T0()   rdtsc()
-#define PROF_T1(s, t0)  do { uint64_t _t1 = rdtsc(); g_ipc_prof[(s)] += (_t1 - (t0)); } while(0)
-
-void mk_ipc_prof_reset(void)
-{
-    memset(g_ipc_prof, 0, sizeof(g_ipc_prof));
-    g_ipc_prof_count = 0;
-}
-
-void mk_ipc_prof_dump(int round_trips)
-{
-    g_ipc_prof_count = round_trips;
-    printf("\n┌─ IPC round-trip cycle breakdown (%d rounds) ────────\n", round_trips);
-    printf("│ %-28s %10s %10s %8s\n", "Stage", "total", "avg", "pct");
-    printf("├───────────────────────────────┬────────────┬────────────┬────────┤\n");
-
-    /* 子项求和 */
-    static const char *names[PROF_N_STEPS] = {
-        "S1 token+write+inflight",
-        "S2 q_push (send)",
-        "S3 wake_recv_waiter",
-        "S4 self BLOCKED+unready",
-        "S5 tick OUT (ctx_swap)",
-        "S6 q_pop x2 (req+reply)",
-        "S7 match inflight (reply)",
-        "S8 q_push (reply)",
-        "S9 wake_send_waiter",
-        "S10 tick IN (ctx_swap)",
-    };
-
-    uint64_t total_sum = 0;
-    for (int s = 0; s < PROF_N_STEPS; s++) total_sum += g_ipc_prof[s];
-
-    for (int s = 0; s < PROF_N_STEPS; s++) {
-        uint64_t t = g_ipc_prof[s];
-        double avg = (double)t / round_trips;
-        double pct = total_sum ? 100.0 * t / total_sum : 0;
-        printf("│ %-28s %10lu %10.1f %7.1f%% │\n",
-               names[s], t, avg, pct);
-    }
-
-    /* 汇总 */
-    uint64_t tick_out = g_ipc_prof[PROF_S5_TICK_OUT];
-    uint64_t tick_in  = g_ipc_prof[PROF_S10_TICK_IN];
-    uint64_t ctx_total = tick_out + tick_in;
-    uint64_t other = total_sum - ctx_total;
-
-    printf("├───────────────────────────────┼────────────┼────────────┼────────┤\n");
-    printf("│ %-28s %10lu %10.1f %7.1f%% │\n",
-           "ctx_swap x2 (S5+S10)", ctx_total, (double)ctx_total/round_trips,
-           total_sum ? 100.0*ctx_total/total_sum : 0);
-    printf("│ %-28s %10lu %10.1f %7.1f%% │\n",
-           "non-ctx work (all else)", other, (double)other/round_trips,
-           total_sum ? 100.0*other/total_sum : 0);
-    printf("├───────────────────────────────┼────────────┼────────────┼────────┤\n");
-    printf("│ %-28s %10lu %10.1f %7.1f%% │\n",
-           "TOTAL (incl rdtsc overhead)", total_sum, (double)total_sum/round_trips, 100.0);
-    printf("└──────────────────────────────────────────────────────────────────┘\n");
-}
-
 /* ---- mailbox 数组 + 全局 reply token 生成器 ---- */
 static mk_mailbox_t g_mboxes[MK_MAX_TASKS];
 static uint16_t     g_reply_counter;
@@ -239,44 +116,22 @@ mk_err_t mk_ipc_send(uint8_t to, const mk_msg_t *msg)
 
     if (!dst_tcb || dst_tcb->state == MK_TASK_DEAD) return MK_ERR_NOIPC;
 
-    /* ── S1: token 分配 + 内核写 from/reply_id + inflight 登记 ── */
-    uint64_t t0 = PROF_T0();
-
     uint16_t reply_id = ++g_reply_counter;
     mk_msg_t full_msg = *msg;
     full_msg.from     = self;
     full_msg.reply_id = reply_id;
 
-    uint64_t t1 = rdtsc();
-    g_ipc_prof[PROF_S1_SEND_PREP] += (t1 - t0);
-
-    /* ── S2: q_push ── */
-    uint64_t t2 = rdtsc();
     uint8_t slot = q_push(dst_mbox, &full_msg);
     dst_mbox->inflight[slot] = true;
     dst_mbox->reply_id_of_slot[slot] = reply_id;
-    uint64_t t3 = rdtsc();
-    g_ipc_prof[PROF_S2_Q_PUSH] += (t3 - t2);
 
-    /* ── S3: wake_recv_waiter ── */
-    uint64_t t4 = rdtsc();
     wake_recv_waiter(to);
-    uint64_t t5 = rdtsc();
-    g_ipc_prof[PROF_S3_WAKE_RECV] += (t5 - t4);
 
-    /* ── S4: 自己 BLOCKED + unready ── */
-    uint64_t t6 = rdtsc();
     me->ipc_send_wait = true;
         mk_tcb_set_state(me, MK_TASK_BLOCKED);
     mk_sched_unready(self);
-    uint64_t t7 = rdtsc();
-    g_ipc_prof[PROF_S4_BLOCK_SELF] += (t7 - t6);
 
-    /* ── S5: tick 切走 (含 ctx_swap) ── */
-    uint64_t t8 = rdtsc();
     mk_sched_tick();
-    uint64_t t9 = rdtsc();
-    g_ipc_prof[PROF_S5_TICK_OUT] += (t9 - t8);
 
     me->ipc_send_wait = false;
     return MK_OK;
@@ -307,18 +162,10 @@ mk_err_t mk_ipc_receive(mk_msg_t *msg)
             mk_tcb_set_state(tcb, MK_TASK_BLOCKED);
         mk_sched_unready(tid);
 
-        /* ── S10: 第二次 receive 队空 → tick 切回 echo ── */
-        uint64_t t0 = rdtsc();
         mk_sched_tick();
-        uint64_t t1 = rdtsc();
-        g_ipc_prof[PROF_S10_TICK_IN] += (t1 - t0);
     }
 
-    /* ── S6: q_pop × 2 (非阻塞：mm 取请求 + echo 取 reply) ── */
-    uint64_t t2 = rdtsc();
     q_pop(mbox, msg);
-    uint64_t t3 = rdtsc();
-    g_ipc_prof[PROF_S6_Q_POP] += (t3 - t2);
     return MK_OK;
 }
 
@@ -357,8 +204,6 @@ mk_err_t mk_ipc_reply(uint8_t to, const mk_msg_t *msg)
     /* ---- 关键校验：reply_id 必须匹配我 mailbox 里某个 inflight slot ---- */
     bool inflight_found = false;
 
-    /* ── S7: 扫 inflight 匹配 reply_id ── */
-    uint64_t t0 = rdtsc();
     for (uint8_t i = 0; i < MK_IPC_QUEUE_SIZE; ++i) {
         if (my_mbox->inflight[i]
                 && my_mbox->reply_id_of_slot[i] == msg->reply_id) {
@@ -368,8 +213,6 @@ mk_err_t mk_ipc_reply(uint8_t to, const mk_msg_t *msg)
             break;
         }
     }
-    uint64_t t1 = rdtsc();
-    g_ipc_prof[PROF_S7_MATCH_INFLIGHT] += (t1 - t0);
 
     if (!inflight_found) {
         return MK_ERR_INVALID;
@@ -379,17 +222,9 @@ mk_err_t mk_ipc_reply(uint8_t to, const mk_msg_t *msg)
     mk_msg_t full_msg = *msg;
     full_msg.from = self;
 
-    /* ── S8: reply q_push ── */
-    uint64_t t2 = rdtsc();
     q_push(dst_mbox, &full_msg);
-    uint64_t t3 = rdtsc();
-    g_ipc_prof[PROF_S8_Q_PUSH_REPLY] += (t3 - t2);
 
-    /* ── S9: wake_send_waiter(echo) ── */
-    uint64_t t4 = rdtsc();
     wake_send_waiter(to);
-    uint64_t t5 = rdtsc();
-    g_ipc_prof[PROF_S9_WAKE_SEND] += (t5 - t4);
 
     return MK_OK;
 }

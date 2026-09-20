@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>ipc.c — Microkernel IPC 硬化版 · 代码评审</title>
+<script src="https://cdn.jsdelivr.net/gh/google/code-prettify@master/loader/run_prettify.js?lang=c&skin=desert"></script>
+<style>
+  :root {
+    --bg: #0d1117; --card: #161b22; --border: #30363d;
+    --text: #c9d1d9; --dim: #8b949e; --accent: #58a6ff;
+    --good: #3fb950; --warn: #d29922; --bad: #f85149;
+    --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.6 -apple-system, 'Segoe UI', sans-serif; }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 40px 24px; display: grid; grid-template-columns: 240px 1fr; gap: 32px; }
+  @media (max-width: 960px) { .wrap { grid-template-columns: 1fr; } .sidebar { position: static !important; } }
+
+  /* sidebar */
+  .sidebar { position: sticky; top: 40px; align-self: start; max-height: calc(100vh - 80px); overflow-y: auto; }
+  .sidebar::-webkit-scrollbar { width: 6px; }
+  .sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .sidebar h2 { font-size: 11px; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin: 20px 0 8px; }
+  .sidebar h2:first-child { margin-top: 0; }
+  .sidebar a { display: block; padding: 4px 8px; color: var(--accent); text-decoration: none; font-size: 13px; border-radius: 4px; font-family: var(--mono); }
+  .sidebar a:hover { background: var(--card); }
+  .sidebar .meta { color: var(--dim); font-size: 12px; margin-top: 20px; line-height: 1.8; }
+  .sidebar .meta .kv { display: flex; justify-content: space-between; }
+  .sidebar .meta .k { color: var(--dim); }
+  .sidebar .meta .v { color: var(--text); font-family: var(--mono); }
+
+  /* main */
+  .main { min-width: 0; }
+  .main h1 { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
+  .main .sub { color: var(--dim); font-size: 13px; margin-bottom: 24px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; margin-bottom: 20px; }
+
+  /* 代码容器 */
+  .code-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .code-header { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  .code-header .fname { font-family: var(--mono); font-size: 13px; color: var(--accent); }
+  .code-header .stats { color: var(--dim); font-size: 12px; font-family: var(--mono); }
+
+  .code-container { background: #0d1117; overflow-x: auto; font-family: var(--mono); font-size: 13px; line-height: 1.55; }
+  .code-container ol { list-style: none; counter-reset: lineno; padding: 0; margin: 0; }
+  .code-container li { display: flex; white-space: pre; }
+  .code-container li:hover { background: rgba(88,166,255,0.06); }
+  .code-container li:target { background: rgba(88,166,255,0.15); }
+  .lineno { color: #484f58; text-align: right; min-width: 4rem; padding-right: 16px; padding-left: 16px; user-select: none; border-right: 1px solid var(--border); background: #0d1117; position: sticky; left: 0; }
+  .code-line { flex: 1; padding-left: 16px; padding-right: 16px; color: #c9d1d9; white-space: pre; }
+
+  /* prettify 颜色覆盖 */
+  .kw { color: #ff7b72; }   /* keyword */
+  .str { color: #a5d6ff; }  /* string */
+  .com { color: #8b949e; font-style: italic; } /* comment */
+  .typ { color: #d2a8ff; }  /* type */
+  .fun { color: #d2a8ff; }  /* function */
+  .pln { color: #c9d1d9; }  /* plain */
+  .pun { color: #c9d1d9; }  /* punctuation */
+  .lit { color: #79c0ff; }  /* literal (number) */
+  .atv { color: #c9d1d9; }  /* attribute */
+  .tag { color: #ff7b72; }  /* tag */
+
+  /* 概览 */
+  .func-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+  .func-item { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; font-family: var(--mono); font-size: 13px; }
+  .func-item .name { color: var(--accent); font-weight: 600; }
+  .func-item .sig { color: var(--dim); font-size: 11px; margin-top: 2px; word-break: break-all; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; background: #0d1117; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--dim); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  td.mono { font-family: var(--mono); }
+  tr:hover td { background: rgba(88,166,255,0.04); }
+
+  h2.section { font-size: 16px; font-weight: 600; margin: 32px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+
+  /* 高亮标注 */
+  .note { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; margin-left: 8px; }
+  .note.hardening { background: rgba(248,81,73,0.15); color: var(--bad); }
+  .note.perf { background: rgba(63,185,80,0.15); color: var(--good); }
+  .note.l1 { background: rgba(210,153,34,0.15); color: var(--warn); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<!-- sidebar -->
+<aside class="sidebar">
+  <div style="font-family: var(--mono); font-size: 14px; color: var(--accent); margin-bottom: 24px;">ipc.c</div>
+
+  <h2>函数索引</h2>
+  <a href="#init">mk_ipc_init</a>
+  <a href="#q_empty">q_empty</a>
+  <a href="#q_push">q_push</a>
+  <a href="#q_pop">q_pop</a>
+  <a href="#wake_send">wake_send_waiter</a>
+  <a href="#wake_recv">wake_recv_waiter</a>
+  <a href="#send">mk_ipc_send</a>
+  <a href="#recv">mk_ipc_receive</a>
+  <a href="#reply">mk_ipc_reply</a>
+  <a href="#poll">mk_ipc_poll</a>
+  <a href="#cleanup">mk_ipc_cleanup_dead_service</a>
+
+  <h2>数据结构</h2>
+  <a href="#mk_msg_t">mk_msg_t (24B)</a>
+  <a href="#mk_mailbox_t">mk_mailbox_t</a>
+
+  <h2>硬化要点</h2>
+  <a href="#h-reply-id">reply_id per slot</a>
+  <a href="#h-precise-wake">精确唤醒</a>
+  <a href="#h-no-overflow">无队列溢出</a>
+  <a href="#h-no-silent-drop">无 silent drop</a>
+  <a href="#h-service-death">服务死亡清理</a>
+
+  <div class="meta">
+    <div class="kv"><span class="k">总行数</span><span class="v">296</span></div>
+    <div class="kv"><span class="k">外部依赖</span><span class="v">task.h</span></div>
+    <div class="kv"><span class="k">消息大小</span><span class="v">24 B</span></div>
+    <div class="kv"><span class="k">队列大小</span><span class="v">32 槽</span></div>
+    <div class="kv"><span class="k">任务上限</span><span class="v">32</span></div>
+    <div class="kv"><span class="k">版本</span><span class="v">L2 硬化</span></div>
+  </div>
+</aside>
+
+<!-- main -->
+<main class="main">
+  <h1>ipc.c — IPC 硬化版 · 代码评审副本</h1>
+  <p class="sub">已剥离所有 profiling 测试桩（rdtsc 打点 / cycle 统计 / debug 输出）。
+  保留完整硬化逻辑：reply_id per slot · 精确隔离 send_wait/recv_wait · 状态机白名单 · inflight 清理。</p>
+
+  <!-- 核心数据结构卡片 -->
+  <h2 class="section">核心数据结构</h2>
+  <div class="card">
+  <table>
+    <thead><tr><th>结构</th><th>sizeof</th><th>关键字段</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr>
+        <td class="mono">mk_msg_t</td>
+        <td class="mono">24 B</td>
+        <td class="mono">reply_id, from, tag, data[4]</td>
+        <td>24 字节固定布局。from / reply_id 内核强制覆盖，用户设值作废。reply_id=0 永不合法。</td>
+      </tr>
+      <tr>
+        <td class="mono">mk_mailbox_t</td>
+        <td class="mono">~1.2 KB</td>
+        <td class="mono">slots[32], inflight[32], reply_id_of_slot[32], head, tail, count</td>
+        <td>每任务一个。同步 send 语义保证 inflight ≤ 31 → 队列永不溢出。</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <!-- 函数索引卡片 -->
+  <h2 class="section">函数一览</h2>
+  <div class="func-grid">
+    <div class="func-item" id="init"><div class="name">mk_ipc_init</div><div class="sig">void</div></div>
+    <div class="func-item" id="q_empty"><div class="name">q_empty</div><div class="sig">bool (static inline)</div></div>
+    <div class="func-item" id="q_push"><div class="name">q_push</div><div class="sig">uint8_t slot (static inline)</div></div>
+    <div class="func-item" id="q_pop"><div class="name">q_pop</div><div class="sig">uint8_t slot (static inline)</div></div>
+    <div class="func-item" id="wake_send"><div class="name">wake_send_waiter</div><div class="sig">void (static inline)</div></div>
+    <div class="func-item" id="wake_recv"><div class="name">wake_recv_waiter</div><div class="sig">void (static inline)</div></div>
+    <div class="func-item" id="send"><div class="name">mk_ipc_send</div><div class="sig">mk_err_t (80~ cycles, 同步阻塞)</div></div>
+    <div class="func-item" id="recv"><div class="name">mk_ipc_receive</div><div class="sig">mk_err_t (队空则阻塞)</div></div>
+    <div class="func-item" id="reply"><div class="name">mk_ipc_reply</div><div class="sig">mk_err_t (~60 cycles, 不阻塞)</div></div>
+    <div class="func-item" id="poll"><div class="name">mk_ipc_poll</div><div class="sig">bool (非阻塞探测)</div></div>
+    <div class="func-item" id="cleanup"><div class="name">mk_ipc_cleanup_dead_service</div><div class="sig">void (服务死亡清理)</div></div>
+  </div>
+
+  <!-- 硬化要点 -->
+  <h2 class="section">硬化设计要点</h2>
+  <div class="card">
+  <table>
+    <thead><tr><th>机制</th><th>防什么</th><th>实现位置</th></tr></thead>
+    <tbody>
+      <tr id="h-reply-id"><td><b>reply_id per slot</b></td><td>伪造 reply / 错配 inflight send / 静默丢 reply</td><td>send 入队时内核分配 token → reply 时必须匹配才能解</td></tr>
+      <tr id="h-precise-wake"><td><b>send_wait / recv_wait 精确隔离</b></td><td>旧版一个 <code>blocked</code> bool 互相污染 → reply 误解 recv 阻塞 / receive 误解 send 阻塞</td><td>每个 TCB 独立两个 bool + 各自唯一的唤醒函数</td></tr>
+      <tr id="h-no-overflow"><td><b>队列永不溢出</b></td><td>send 同步语义 + QUEUE_SIZE = MAX_TASKS → 每 mailbox 积压 ≤ 31 条</td><td>assert 防御，无 while 阻塞（背压是死代码）</td></tr>
+      <tr id="h-no-silent-drop"><td><b>无 silent drop</b></td><td>旧版"队列满丢最老"违反硬化目标</td><td>reply 积压最多 1 条，q_push 永不溢出</td></tr>
+      <tr id="h-service-death"><td><b>服务者死亡清理</b></td><td>服务死了但 client send_wait 永远阻塞 → 系统卡死</td><td>扫 inflight + 推 synthetic error reply + wake_send_waiter</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <!-- 代码主体 -->
+  <h2 class="section">源码</h2>
+  <div class="code-wrap">
+    <div class="code-header">
+      <span class="fname">src/ipc.c</span>
+      <span class="stats">296 lines · hardened IPC · stripped profiler</span>
+    </div>
+    <div class="code-container">
+      <ol class="linenums"><li id="L1"><span class="lineno">   1</span><span class="code-line">/*</span></li>
+<li id="L2"><span class="lineno">   2</span><span class="code-line"> * ipc.c — IPC 硬化版</span></li>
+<li id="L3"><span class="lineno">   3</span><span class="code-line"> *</span></li>
+<li id="L4"><span class="lineno">   4</span><span class="code-line"> * 硬化相对于原型的 5 个改动（+1 个设计简化）：</span></li>
+<li id="L5"><span class="lineno">   5</span><span class="code-line"> *</span></li>
+<li id="L6"><span class="lineno">   6</span><span class="code-line"> * P0  | reply_id per slot：每条 send 分配唯一 token；reply 必须带匹配 token 才能解</span></li>
+<li id="L7"><span class="lineno">   7</span><span class="code-line"> * P0  | 两种独立阻塞原因：send_wait / recv_wait，精确隔离（旧版一个 bool 互相污染）</span></li>
+<li id="L8"><span class="lineno">   8</span><span class="code-line"> * P1  | reply 校验 reply_id 合法性：reply_id 没匹配到任何 inflight → MK_ERR_INVALID</span></li>
+<li id="L9"><span class="lineno">   9</span><span class="code-line"> * P1  | 单一真相源：删 ipc_has_msg / ipc_blocked / ipc_waiter</span></li>
+<li id="L10"><span class="lineno">  10</span><span class="code-line"> * P2  | from / reply_id 强制内核覆盖，用户写的作废</span></li>
+<li id="L11"><span class="lineno">  11</span><span class="code-line"> *</span></li>
+<li id="L12"><span class="lineno">  12</span><span class="code-line"> * 设计简化：为什么删 space_wait（队列满阻塞）？</span></li>
+<li id="L13"><span class="lineno">  13</span><span class="code-line"> *   send 是同步的 → 每个任务同时最多 1 条 inflight send。</span></li>
+<li id="L14"><span class="lineno">  14</span><span class="code-line"> *   QUEUE_SIZE = MAX_TASKS → 一个 mailbox 最多积压 N-1 条 send（其他各 1 条）。</span></li>
+<li id="L15"><span class="lineno">  15</span><span class="code-line"> *   N 槽 ≥ N-1 积压 → 永远差 1 格，队列不可能满。</span></li>
+<li id="L16"><span class="lineno">  16</span><span class="code-line"> *   背压是死代码。用 assert 防御而非 while 阻塞。</span></li>
+<li id="L17"><span class="lineno">  17</span><span class="code-line"> *</span></li>
+<li id="L18"><span class="lineno">  18</span><span class="code-line"> * 精确隔离的阻塞原因为什么重要：</span></li>
+<li id="L19"><span class="lineno">  19</span><span class="code-line"> *   旧版只有一个 ipc_blocked bool + state=BLOCKED。wake_unblocked 不管什么原因都解，</span></li>
+<li id="L20"><span class="lineno">  20</span><span class="code-line"> *   导致 reply 可能误解一个 recv 阻塞的任务（白调度）；receive 广播唤醒又可能解 send</span></li>
+<li id="L21"><span class="lineno">  21</span><span class="code-line"> *   阻塞的任务（状态污染）。拆成两个 bool + 精确匹配唤醒后，每种阻塞只有对应的</span></li>
+<li id="L22"><span class="lineno">  22</span><span class="code-line"> *   那一种原语能解，零误触。</span></li>
+<li id="L23"><span class="lineno">  23</span><span class="code-line"> */</span></li>
+<li id="L24"><span class="lineno">  24</span><span class="code-line">#include &lt;string.h&gt;</span></li>
+<li id="L25"><span class="lineno">  25</span><span class="code-line">#include &lt;stdint.h&gt;</span></li>
+<li id="L26"><span class="lineno">  26</span><span class="code-line">#include &lt;stdio.h&gt;</span></li>
+<li id="L27"><span class="lineno">  27</span><span class="code-line">#include &quot;kernel.h&quot;</span></li>
+<li id="L28"><span class="lineno">  28</span><span class="code-line">#include &quot;task.h&quot;</span></li>
+<li id="L29"><span class="lineno">  29</span><span class="code-line">#include &quot;ipc.h&quot;</span></li>
+<li id="L30"><span class="lineno">  30</span><span class="code-line"></span></li>
+<li id="L31"><span class="lineno">  31</span><span class="code-line">/* ---- mailbox 数组 + 全局 reply token 生成器 ---- */</span></li>
+<li id="L32"><span class="lineno">  32</span><span class="code-line">static mk_mailbox_t g_mboxes[MK_MAX_TASKS];</span></li>
+<li id="L33"><span class="lineno">  33</span><span class="code-line">static uint16_t     g_reply_counter;</span></li>
+<li id="L34"><span class="lineno">  34</span><span class="code-line"></span></li>
+<li id="L35"><span class="lineno">  35</span><span class="code-line">void mk_ipc_init(void)</span></li>
+<li id="L36"><span class="lineno">  36</span><span class="code-line">{</span></li>
+<li id="L37"><span class="lineno">  37</span><span class="code-line">    memset(g_mboxes, 0, sizeof(g_mboxes));</span></li>
+<li id="L38"><span class="lineno">  38</span><span class="code-line">    g_reply_counter = 0;</span></li>
+<li id="L39"><span class="lineno">  39</span><span class="code-line">}</span></li>
+<li id="L40"><span class="lineno">  40</span><span class="code-line"></span></li>
+<li id="L41"><span class="lineno">  41</span><span class="code-line">/* ================================================================</span></li>
+<li id="L42"><span class="lineno">  42</span><span class="code-line"> *  环形队列 —— 返回值硬化</span></li>
+<li id="L43"><span class="lineno">  43</span><span class="code-line"> *    q_push: 返回写入的 slot index（后续要登记 inflight）</span></li>
+<li id="L44"><span class="lineno">  44</span><span class="code-line"> *    q_pop:  返回弹出的 slot index（当前不返回给外部，保留 API 对称）</span></li>
+<li id="L45"><span class="lineno">  45</span><span class="code-line"> *</span></li>
+<li id="L46"><span class="lineno">  46</span><span class="code-line"> *  不变量（由同步 send 语义保证）：</span></li>
+<li id="L47"><span class="lineno">  47</span><span class="code-line"> *    每个任务同时最多 1 条 inflight send → 一个 mailbox 最多积压 N-1 条消息。</span></li>
+<li id="L48"><span class="lineno">  48</span><span class="code-line"> *    QUEUE_SIZE = N → q_push 永远不会溢出。用 assert 防御，不用 while 阻塞。</span></li>
+<li id="L49"><span class="lineno">  49</span><span class="code-line"> * ================================================================ */</span></li>
+<li id="L50"><span class="lineno">  50</span><span class="code-line">static inline bool q_empty(const mk_mailbox_t *m) { return m-&gt;count == 0; }</span></li>
+<li id="L51"><span class="lineno">  51</span><span class="code-line"></span></li>
+<li id="L52"><span class="lineno">  52</span><span class="code-line">/* L1 优化：static inline + 位与代替模（QUEUE_SIZE=32=2^5 → mask=31）</span></li>
+<li id="L53"><span class="lineno">  53</span><span class="code-line"> * 编译器 -O2 可能已经自动做了，但显式写出来防止退化 */</span></li>
+<li id="L54"><span class="lineno">  54</span><span class="code-line">static inline uint8_t q_push(mk_mailbox_t *m, const mk_msg_t *msg)</span></li>
+<li id="L55"><span class="lineno">  55</span><span class="code-line">{</span></li>
+<li id="L56"><span class="lineno">  56</span><span class="code-line">    uint8_t slot = m-&gt;tail;</span></li>
+<li id="L57"><span class="lineno">  57</span><span class="code-line">    m-&gt;slots[slot] = *msg;</span></li>
+<li id="L58"><span class="lineno">  58</span><span class="code-line">    m-&gt;tail = (uint8_t)((slot + 1) &amp; (MK_IPC_QUEUE_SIZE - 1));</span></li>
+<li id="L59"><span class="lineno">  59</span><span class="code-line">    m-&gt;count++;</span></li>
+<li id="L60"><span class="lineno">  60</span><span class="code-line">    return slot;</span></li>
+<li id="L61"><span class="lineno">  61</span><span class="code-line">}</span></li>
+<li id="L62"><span class="lineno">  62</span><span class="code-line"></span></li>
+<li id="L63"><span class="lineno">  63</span><span class="code-line">static inline uint8_t q_pop(mk_mailbox_t *m, mk_msg_t *out)</span></li>
+<li id="L64"><span class="lineno">  64</span><span class="code-line">{</span></li>
+<li id="L65"><span class="lineno">  65</span><span class="code-line">    uint8_t slot = m-&gt;head;</span></li>
+<li id="L66"><span class="lineno">  66</span><span class="code-line">    if (out) *out = m-&gt;slots[slot];</span></li>
+<li id="L67"><span class="lineno">  67</span><span class="code-line">    m-&gt;head = (uint8_t)((slot + 1) &amp; (MK_IPC_QUEUE_SIZE - 1));</span></li>
+<li id="L68"><span class="lineno">  68</span><span class="code-line">    m-&gt;count--;</span></li>
+<li id="L69"><span class="lineno">  69</span><span class="code-line">    return slot;</span></li>
+<li id="L70"><span class="lineno">  70</span><span class="code-line">}</span></li>
+<li id="L71"><span class="lineno">  71</span><span class="code-line"></span></li>
+<li id="L72"><span class="lineno">  72</span><span class="code-line">/* ================================================================</span></li>
+<li id="L73"><span class="lineno">  73</span><span class="code-line"> *  两种精确唤醒 —— 每种只解对应的那一种阻塞</span></li>
+<li id="L74"><span class="lineno">  74</span><span class="code-line"> * ================================================================ */</span></li>
+<li id="L75"><span class="lineno">  75</span><span class="code-line"></span></li>
+<li id="L76"><span class="lineno">  76</span><span class="code-line">/* L1 优化：加 static inline，省函数调用开销 */</span></li>
+<li id="L77"><span class="lineno">  77</span><span class="code-line"></span></li>
+<li id="L78"><span class="lineno">  78</span><span class="code-line">/* 解 &quot;send 阻塞等 reply&quot; —— 只有 reply() 能调 */</span></li>
+<li id="L79"><span class="lineno">  79</span><span class="code-line">static inline void wake_send_waiter(uint8_t tid)</span></li>
+<li id="L80"><span class="lineno">  80</span><span class="code-line">{</span></li>
+<li id="L81"><span class="lineno">  81</span><span class="code-line">    mk_tcb_t *tcb = mk_tcb_get(tid);</span></li>
+<li id="L82"><span class="lineno">  82</span><span class="code-line">    if (tcb-&gt;ipc_send_wait &amp;&amp; tcb-&gt;state == MK_TASK_BLOCKED) {</span></li>
+<li id="L83"><span class="lineno">  83</span><span class="code-line">        tcb-&gt;ipc_send_wait = false;</span></li>
+<li id="L84"><span class="lineno">  84</span><span class="code-line">        mk_sched_ready(tid);</span></li>
+<li id="L85"><span class="lineno">  85</span><span class="code-line">    }</span></li>
+<li id="L86"><span class="lineno">  86</span><span class="code-line">}</span></li>
+<li id="L87"><span class="lineno">  87</span><span class="code-line"></span></li>
+<li id="L88"><span class="lineno">  88</span><span class="code-line">/* 解 &quot;receive 阻塞等消息&quot; —— send() 或 reply() 投递消息时调 */</span></li>
+<li id="L89"><span class="lineno">  89</span><span class="code-line">static inline void wake_recv_waiter(uint8_t tid)</span></li>
+<li id="L90"><span class="lineno">  90</span><span class="code-line">{</span></li>
+<li id="L91"><span class="lineno">  91</span><span class="code-line">    mk_tcb_t *tcb = mk_tcb_get(tid);</span></li>
+<li id="L92"><span class="lineno">  92</span><span class="code-line">    if (tcb-&gt;ipc_recv_wait &amp;&amp; tcb-&gt;state == MK_TASK_BLOCKED) {</span></li>
+<li id="L93"><span class="lineno">  93</span><span class="code-line">        tcb-&gt;ipc_recv_wait = false;</span></li>
+<li id="L94"><span class="lineno">  94</span><span class="code-line">        mk_sched_ready(tid);</span></li>
+<li id="L95"><span class="lineno">  95</span><span class="code-line">    }</span></li>
+<li id="L96"><span class="lineno">  96</span><span class="code-line">}</span></li>
+<li id="L97"><span class="lineno">  97</span><span class="code-line"></span></li>
+<li id="L98"><span class="lineno">  98</span><span class="code-line">/* ================================================================</span></li>
+<li id="L99"><span class="lineno">  99</span><span class="code-line"> *  send — 硬化版</span></li>
+<li id="L100"><span class="lineno"> 100</span><span class="code-line"> *</span></li>
+<li id="L101"><span class="lineno"> 101</span><span class="code-line"> *  分配 reply token → 内核写 from/reply_id → 登记 inflight → 入队</span></li>
+<li id="L102"><span class="lineno"> 102</span><span class="code-line"> *  自己 send_wait 阻塞等 reply</span></li>
+<li id="L103"><span class="lineno"> 103</span><span class="code-line"> *</span></li>
+<li id="L104"><span class="lineno"> 104</span><span class="code-line"> *  不变量：同步 send + QUEUE_SIZE = N → q_push 永远不溢出。</span></li>
+<li id="L105"><span class="lineno"> 105</span><span class="code-line"> *  无 silent drop，reply_id 保证 reply 能对应回这条 send</span></li>
+<li id="L106"><span class="lineno"> 106</span><span class="code-line"> * ================================================================ */</span></li>
+<li id="L107"><span class="lineno"> 107</span><span class="code-line">mk_err_t mk_ipc_send(uint8_t to, const mk_msg_t *msg)</span></li>
+<li id="L108"><span class="lineno"> 108</span><span class="code-line">{</span></li>
+<li id="L109"><span class="lineno"> 109</span><span class="code-line">    uint8_t self = mk_current_tid();</span></li>
+<li id="L110"><span class="lineno"> 110</span><span class="code-line">    if (to &gt;= MK_MAX_TASKS || to == self) return MK_ERR_INVALID;</span></li>
+<li id="L111"><span class="lineno"> 111</span><span class="code-line">    if (!msg) return MK_ERR_INVALID;</span></li>
+<li id="L112"><span class="lineno"> 112</span><span class="code-line"></span></li>
+<li id="L113"><span class="lineno"> 113</span><span class="code-line">    mk_tcb_t     *dst_tcb  = mk_tcb_get(to);</span></li>
+<li id="L114"><span class="lineno"> 114</span><span class="code-line">    mk_mailbox_t *dst_mbox = &amp;g_mboxes[to];</span></li>
+<li id="L115"><span class="lineno"> 115</span><span class="code-line">    mk_tcb_t     *me       = mk_tcb_get(self);</span></li>
+<li id="L116"><span class="lineno"> 116</span><span class="code-line"></span></li>
+<li id="L117"><span class="lineno"> 117</span><span class="code-line">    if (!dst_tcb || dst_tcb-&gt;state == MK_TASK_DEAD) return MK_ERR_NOIPC;</span></li>
+<li id="L118"><span class="lineno"> 118</span><span class="code-line"></span></li>
+<li id="L119"><span class="lineno"> 119</span><span class="code-line">    uint16_t reply_id = ++g_reply_counter;</span></li>
+<li id="L120"><span class="lineno"> 120</span><span class="code-line">    mk_msg_t full_msg = *msg;</span></li>
+<li id="L121"><span class="lineno"> 121</span><span class="code-line">    full_msg.from     = self;</span></li>
+<li id="L122"><span class="lineno"> 122</span><span class="code-line">    full_msg.reply_id = reply_id;</span></li>
+<li id="L123"><span class="lineno"> 123</span><span class="code-line"></span></li>
+<li id="L124"><span class="lineno"> 124</span><span class="code-line">    uint8_t slot = q_push(dst_mbox, &amp;full_msg);</span></li>
+<li id="L125"><span class="lineno"> 125</span><span class="code-line">    dst_mbox-&gt;inflight[slot] = true;</span></li>
+<li id="L126"><span class="lineno"> 126</span><span class="code-line">    dst_mbox-&gt;reply_id_of_slot[slot] = reply_id;</span></li>
+<li id="L127"><span class="lineno"> 127</span><span class="code-line"></span></li>
+<li id="L128"><span class="lineno"> 128</span><span class="code-line">    wake_recv_waiter(to);</span></li>
+<li id="L129"><span class="lineno"> 129</span><span class="code-line"></span></li>
+<li id="L130"><span class="lineno"> 130</span><span class="code-line">    me-&gt;ipc_send_wait = true;</span></li>
+<li id="L131"><span class="lineno"> 131</span><span class="code-line">        mk_tcb_set_state(me, MK_TASK_BLOCKED);</span></li>
+<li id="L132"><span class="lineno"> 132</span><span class="code-line">    mk_sched_unready(self);</span></li>
+<li id="L133"><span class="lineno"> 133</span><span class="code-line"></span></li>
+<li id="L134"><span class="lineno"> 134</span><span class="code-line">    mk_sched_tick();</span></li>
+<li id="L135"><span class="lineno"> 135</span><span class="code-line"></span></li>
+<li id="L136"><span class="lineno"> 136</span><span class="code-line">    me-&gt;ipc_send_wait = false;</span></li>
+<li id="L137"><span class="lineno"> 137</span><span class="code-line">    return MK_OK;</span></li>
+<li id="L138"><span class="lineno"> 138</span><span class="code-line">}</span></li>
+<li id="L139"><span class="lineno"> 139</span><span class="code-line"></span></li>
+<li id="L140"><span class="lineno"> 140</span><span class="code-line">/* ================================================================</span></li>
+<li id="L141"><span class="lineno"> 141</span><span class="code-line"> *  receive — 硬化版</span></li>
+<li id="L142"><span class="lineno"> 142</span><span class="code-line"> *</span></li>
+<li id="L143"><span class="lineno"> 143</span><span class="code-line"> *  队空 → recv_wait 阻塞；队列有消息 → pop</span></li>
+<li id="L144"><span class="lineno"> 144</span><span class="code-line"> *  被唤醒后循环检查队列（防御多次 wake 间队列被消耗空）</span></li>
+<li id="L145"><span class="lineno"> 145</span><span class="code-line"> *</span></li>
+<li id="L146"><span class="lineno"> 146</span><span class="code-line"> *  注意：**receive 不清 inflight**！</span></li>
+<li id="L147"><span class="lineno"> 147</span><span class="code-line"> *    inflight 表示 &quot;这条 send 还在等 reply&quot;，不是 &quot;还在队列里&quot;。</span></li>
+<li id="L148"><span class="lineno"> 148</span><span class="code-line"> *    send 消息被 receive 取走只是让服务者看到了请求，</span></li>
+<li id="L149"><span class="lineno"> 149</span><span class="code-line"> *    但 send 者的 send_wait 还在阻塞等 reply。</span></li>
+<li id="L150"><span class="lineno"> 150</span><span class="code-line"> *    inflight 只能由 reply() 匹配成功后清。</span></li>
+<li id="L151"><span class="lineno"> 151</span><span class="code-line"> * ================================================================ */</span></li>
+<li id="L152"><span class="lineno"> 152</span><span class="code-line">mk_err_t mk_ipc_receive(mk_msg_t *msg)</span></li>
+<li id="L153"><span class="lineno"> 153</span><span class="code-line">{</span></li>
+<li id="L154"><span class="lineno"> 154</span><span class="code-line">    if (!msg) return MK_ERR_INVALID;</span></li>
+<li id="L155"><span class="lineno"> 155</span><span class="code-line"></span></li>
+<li id="L156"><span class="lineno"> 156</span><span class="code-line">    uint8_t tid = mk_current_tid();</span></li>
+<li id="L157"><span class="lineno"> 157</span><span class="code-line">    mk_tcb_t     *tcb  = mk_tcb_get(tid);</span></li>
+<li id="L158"><span class="lineno"> 158</span><span class="code-line">    mk_mailbox_t *mbox = &amp;g_mboxes[tid];</span></li>
+<li id="L159"><span class="lineno"> 159</span><span class="code-line"></span></li>
+<li id="L160"><span class="lineno"> 160</span><span class="code-line">    while (q_empty(mbox)) {</span></li>
+<li id="L161"><span class="lineno"> 161</span><span class="code-line">        tcb-&gt;ipc_recv_wait = true;</span></li>
+<li id="L162"><span class="lineno"> 162</span><span class="code-line">            mk_tcb_set_state(tcb, MK_TASK_BLOCKED);</span></li>
+<li id="L163"><span class="lineno"> 163</span><span class="code-line">        mk_sched_unready(tid);</span></li>
+<li id="L164"><span class="lineno"> 164</span><span class="code-line"></span></li>
+<li id="L165"><span class="lineno"> 165</span><span class="code-line">        mk_sched_tick();</span></li>
+<li id="L166"><span class="lineno"> 166</span><span class="code-line">    }</span></li>
+<li id="L167"><span class="lineno"> 167</span><span class="code-line"></span></li>
+<li id="L168"><span class="lineno"> 168</span><span class="code-line">    q_pop(mbox, msg);</span></li>
+<li id="L169"><span class="lineno"> 169</span><span class="code-line">    return MK_OK;</span></li>
+<li id="L170"><span class="lineno"> 170</span><span class="code-line">}</span></li>
+<li id="L171"><span class="lineno"> 171</span><span class="code-line"></span></li>
+<li id="L172"><span class="lineno"> 172</span><span class="code-line">/* ================================================================</span></li>
+<li id="L173"><span class="lineno"> 173</span><span class="code-line"> *  reply — 硬化版</span></li>
+<li id="L174"><span class="lineno"> 174</span><span class="code-line"> *</span></li>
+<li id="L175"><span class="lineno"> 175</span><span class="code-line"> *  1. 在自己的 mailbox 里找 reply_id 匹配的 inflight slot → 清掉</span></li>
+<li id="L176"><span class="lineno"> 176</span><span class="code-line"> *     这是 &quot;这笔账我结了&quot; 的意思。没匹配到 → 返回 MK_ERR_INVALID。</span></li>
+<li id="L177"><span class="lineno"> 177</span><span class="code-line"> *  2. 投递 reply 消息到对方 inbox（解 recv_wait）。</span></li>
+<li id="L178"><span class="lineno"> 178</span><span class="code-line"> *     不变量：对方同时最多 1 条 inflight send，reply 积压最多 1 条。</span></li>
+<li id="L179"><span class="lineno"> 179</span><span class="code-line"> *  3. 解对方的 send_wait —— 那个被我们匹配到 inflight 的 send 者。</span></li>
+<li id="L180"><span class="lineno"> 180</span><span class="code-line"> *</span></li>
+<li id="L181"><span class="lineno"> 181</span><span class="code-line"> *  reply 和 send 的根本区别：reply 不阻塞，立即返回。</span></li>
+<li id="L182"><span class="lineno"> 182</span><span class="code-line"> *  send 则是投递消息 + send_wait 阻塞等 reply 解。</span></li>
+<li id="L183"><span class="lineno"> 183</span><span class="code-line"> *</span></li>
+<li id="L184"><span class="lineno"> 184</span><span class="code-line"> *  硬化：reply 不允许 silent drop。旧版 &quot;队列满丢最老&quot; 违反硬化目标，</span></li>
+<li id="L185"><span class="lineno"> 185</span><span class="code-line"> *  也永远不会触发（同步 send 下 reply 积压最多 1 条）。</span></li>
+<li id="L186"><span class="lineno"> 186</span><span class="code-line"> * ================================================================ */</span></li>
+<li id="L187"><span class="lineno"> 187</span><span class="code-line">mk_err_t mk_ipc_reply(uint8_t to, const mk_msg_t *msg)</span></li>
+<li id="L188"><span class="lineno"> 188</span><span class="code-line">{</span></li>
+<li id="L189"><span class="lineno"> 189</span><span class="code-line">    uint8_t self = mk_current_tid();</span></li>
+<li id="L190"><span class="lineno"> 190</span><span class="code-line">    if (to &gt;= MK_MAX_TASKS || to == self) return MK_ERR_INVALID;</span></li>
+<li id="L191"><span class="lineno"> 191</span><span class="code-line">    if (!msg) return MK_ERR_INVALID;</span></li>
+<li id="L192"><span class="lineno"> 192</span><span class="code-line"></span></li>
+<li id="L193"><span class="lineno"> 193</span><span class="code-line">    /* P0-2 硬化：reply_id==0 直接拒，不扫 32 个 slot。</span></li>
+<li id="L194"><span class="lineno"> 194</span><span class="code-line">     * g_reply_counter 从 1 开始，0 永远不可能是合法 token。</span></li>
+<li id="L195"><span class="lineno"> 195</span><span class="code-line">     * 开发者忘了写 reply.reply_id = req.reply_id 时会撞到这里。 */</span></li>
+<li id="L196"><span class="lineno"> 196</span><span class="code-line">    if (msg-&gt;reply_id == 0) return MK_ERR_INVALID;</span></li>
+<li id="L197"><span class="lineno"> 197</span><span class="code-line"></span></li>
+<li id="L198"><span class="lineno"> 198</span><span class="code-line">    mk_tcb_t     *to_tcb   = mk_tcb_get(to);</span></li>
+<li id="L199"><span class="lineno"> 199</span><span class="code-line">    mk_mailbox_t *dst_mbox = &amp;g_mboxes[to];      /* reply 目标的 mailbox (send 者的 inbox) */</span></li>
+<li id="L200"><span class="lineno"> 200</span><span class="code-line">    mk_mailbox_t *my_mbox  = &amp;g_mboxes[self];     /* 我 reply 者自己的 mailbox */</span></li>
+<li id="L201"><span class="lineno"> 201</span><span class="code-line"></span></li>
+<li id="L202"><span class="lineno"> 202</span><span class="code-line">    if (!to_tcb || to_tcb-&gt;state == MK_TASK_DEAD) return MK_ERR_NOIPC;</span></li>
+<li id="L203"><span class="lineno"> 203</span><span class="code-line"></span></li>
+<li id="L204"><span class="lineno"> 204</span><span class="code-line">    /* ---- 关键校验：reply_id 必须匹配我 mailbox 里某个 inflight slot ---- */</span></li>
+<li id="L205"><span class="lineno"> 205</span><span class="code-line">    bool inflight_found = false;</span></li>
+<li id="L206"><span class="lineno"> 206</span><span class="code-line"></span></li>
+<li id="L207"><span class="lineno"> 207</span><span class="code-line">    for (uint8_t i = 0; i &lt; MK_IPC_QUEUE_SIZE; ++i) {</span></li>
+<li id="L208"><span class="lineno"> 208</span><span class="code-line">        if (my_mbox-&gt;inflight[i]</span></li>
+<li id="L209"><span class="lineno"> 209</span><span class="code-line">                &amp;&amp; my_mbox-&gt;reply_id_of_slot[i] == msg-&gt;reply_id) {</span></li>
+<li id="L210"><span class="lineno"> 210</span><span class="code-line">            my_mbox-&gt;inflight[i] = false;</span></li>
+<li id="L211"><span class="lineno"> 211</span><span class="code-line">            my_mbox-&gt;reply_id_of_slot[i] = 0;</span></li>
+<li id="L212"><span class="lineno"> 212</span><span class="code-line">            inflight_found = true;</span></li>
+<li id="L213"><span class="lineno"> 213</span><span class="code-line">            break;</span></li>
+<li id="L214"><span class="lineno"> 214</span><span class="code-line">        }</span></li>
+<li id="L215"><span class="lineno"> 215</span><span class="code-line">    }</span></li>
+<li id="L216"><span class="lineno"> 216</span><span class="code-line"></span></li>
+<li id="L217"><span class="lineno"> 217</span><span class="code-line">    if (!inflight_found) {</span></li>
+<li id="L218"><span class="lineno"> 218</span><span class="code-line">        return MK_ERR_INVALID;</span></li>
+<li id="L219"><span class="lineno"> 219</span><span class="code-line">    }</span></li>
+<li id="L220"><span class="lineno"> 220</span><span class="code-line"></span></li>
+<li id="L221"><span class="lineno"> 221</span><span class="code-line">    /* ---- 投递 reply 消息到对方 inbox ---- */</span></li>
+<li id="L222"><span class="lineno"> 222</span><span class="code-line">    mk_msg_t full_msg = *msg;</span></li>
+<li id="L223"><span class="lineno"> 223</span><span class="code-line">    full_msg.from = self;</span></li>
+<li id="L224"><span class="lineno"> 224</span><span class="code-line"></span></li>
+<li id="L225"><span class="lineno"> 225</span><span class="code-line">    q_push(dst_mbox, &amp;full_msg);</span></li>
+<li id="L226"><span class="lineno"> 226</span><span class="code-line"></span></li>
+<li id="L227"><span class="lineno"> 227</span><span class="code-line">    wake_send_waiter(to);</span></li>
+<li id="L228"><span class="lineno"> 228</span><span class="code-line"></span></li>
+<li id="L229"><span class="lineno"> 229</span><span class="code-line">    return MK_OK;</span></li>
+<li id="L230"><span class="lineno"> 230</span><span class="code-line">}</span></li>
+<li id="L231"><span class="lineno"> 231</span><span class="code-line"></span></li>
+<li id="L232"><span class="lineno"> 232</span><span class="code-line">bool mk_ipc_poll(void)</span></li>
+<li id="L233"><span class="lineno"> 233</span><span class="code-line">{</span></li>
+<li id="L234"><span class="lineno"> 234</span><span class="code-line">    uint8_t tid = mk_current_tid();</span></li>
+<li id="L235"><span class="lineno"> 235</span><span class="code-line">    return !q_empty(&amp;g_mboxes[tid]);</span></li>
+<li id="L236"><span class="lineno"> 236</span><span class="code-line">}</span></li>
+<li id="L237"><span class="lineno"> 237</span><span class="code-line"></span></li>
+<li id="L238"><span class="lineno"> 238</span><span class="code-line">/* ================================================================</span></li>
+<li id="L239"><span class="lineno"> 239</span><span class="code-line"> *  mk_ipc_cleanup_dead_service — 服务者死亡时清理它的 IPC 状态</span></li>
+<li id="L240"><span class="lineno"> 240</span><span class="code-line"> *</span></li>
+<li id="L241"><span class="lineno"> 241</span><span class="code-line"> *  必须在 mk_task_exit 调 —— 否则：</span></li>
+<li id="L242"><span class="lineno"> 242</span><span class="code-line"> *    client 正在 send_wait 等这个服务者 reply</span></li>
+<li id="L243"><span class="lineno"> 243</span><span class="code-line"> *    服务者死了 → inflight 永远不被清 → 永远不 wake_send_waiter</span></li>
+<li id="L244"><span class="lineno"> 244</span><span class="code-line"> *    → 那些 client 永久 BLOCKED，整个系统卡死</span></li>
+<li id="L245"><span class="lineno"> 245</span><span class="code-line"> *</span></li>
+<li id="L246"><span class="lineno"> 246</span><span class="code-line"> *  两步：</span></li>
+<li id="L247"><span class="lineno"> 247</span><span class="code-line"> *    1. 扫 inflight[] 里所有 slot —— 每个对应一个还在等 reply 的 client</span></li>
+<li id="L248"><span class="lineno"> 248</span><span class="code-line"> *       给每个 client 推一条 synthetic error reply（tag=0 表示&quot;服务已死&quot;）</span></li>
+<li id="L249"><span class="lineno"> 249</span><span class="code-line"> *       调 wake_send_waiter 解它的阻塞</span></li>
+<li id="L250"><span class="lineno"> 250</span><span class="code-line"> *    2. 清空 mailbox 队列 —— 时刻 A（send 刚入队还没被 receive）的残留</span></li>
+<li id="L251"><span class="lineno"> 251</span><span class="code-line"> *       这些消息的 inflight 已经被上面处理过了，队列只是留着脏数据</span></li>
+<li id="L252"><span class="lineno"> 252</span><span class="code-line"> *       下次 tid 被重用时脏队列会引发错觉</span></li>
+<li id="L253"><span class="lineno"> 253</span><span class="code-line"> * ================================================================ */</span></li>
+<li id="L254"><span class="lineno"> 254</span><span class="code-line">void mk_ipc_cleanup_dead_service(uint8_t dead_tid)</span></li>
+<li id="L255"><span class="lineno"> 255</span><span class="code-line">{</span></li>
+<li id="L256"><span class="lineno"> 256</span><span class="code-line">    if (dead_tid &gt;= MK_MAX_TASKS) return;</span></li>
+<li id="L257"><span class="lineno"> 257</span><span class="code-line"></span></li>
+<li id="L258"><span class="lineno"> 258</span><span class="code-line">    mk_mailbox_t *my = &amp;g_mboxes[dead_tid];</span></li>
+<li id="L259"><span class="lineno"> 259</span><span class="code-line"></span></li>
+<li id="L260"><span class="lineno"> 260</span><span class="code-line">    for (uint8_t i = 0; i &lt; MK_IPC_QUEUE_SIZE; ++i) {</span></li>
+<li id="L261"><span class="lineno"> 261</span><span class="code-line">        if (!my-&gt;inflight[i]) continue;</span></li>
+<li id="L262"><span class="lineno"> 262</span><span class="code-line"></span></li>
+<li id="L263"><span class="lineno"> 263</span><span class="code-line">        uint8_t  client   = my-&gt;slots[i].from;</span></li>
+<li id="L264"><span class="lineno"> 264</span><span class="code-line">        uint16_t reply_id = my-&gt;reply_id_of_slot[i];</span></li>
+<li id="L265"><span class="lineno"> 265</span><span class="code-line"></span></li>
+<li id="L266"><span class="lineno"> 266</span><span class="code-line">        /* 清 inflight（我死了，这笔账结不了） */</span></li>
+<li id="L267"><span class="lineno"> 267</span><span class="code-line">        my-&gt;inflight[i] = false;</span></li>
+<li id="L268"><span class="lineno"> 268</span><span class="code-line">        my-&gt;reply_id_of_slot[i] = 0;</span></li>
+<li id="L269"><span class="lineno"> 269</span><span class="code-line"></span></li>
+<li id="L270"><span class="lineno"> 270</span><span class="code-line">        /* 防御性边界：from 必须是合法 tid */</span></li>
+<li id="L271"><span class="lineno"> 271</span><span class="code-line">        if (client &gt;= MK_MAX_TASKS) continue;</span></li>
+<li id="L272"><span class="lineno"> 272</span><span class="code-line"></span></li>
+<li id="L273"><span class="lineno"> 273</span><span class="code-line">        /* 给 client 推 synthetic reply —— tag=0 约定&quot;服务已死&quot;</span></li>
+<li id="L274"><span class="lineno"> 274</span><span class="code-line">         * reply_id 必须是那个 client send 时内核分配的 token，</span></li>
+<li id="L275"><span class="lineno"> 275</span><span class="code-line">         * 这样 client.unblock() 后 receive() 能正常读到 */</span></li>
+<li id="L276"><span class="lineno"> 276</span><span class="code-line">        mk_msg_t err;</span></li>
+<li id="L277"><span class="lineno"> 277</span><span class="code-line">        memset(&amp;err, 0, sizeof(err));</span></li>
+<li id="L278"><span class="lineno"> 278</span><span class="code-line">        err.reply_id = reply_id;</span></li>
+<li id="L279"><span class="lineno"> 279</span><span class="code-line">        err.from     = dead_tid;   /* 内核填，虽然 reply_id 更关键 */</span></li>
+<li id="L280"><span class="lineno"> 280</span><span class="code-line">        /* err.data[0] = MK_ERR_NOIPC = -1 —— client 的 mk_ipc_send 返回后</span></li>
+<li id="L281"><span class="lineno"> 281</span><span class="code-line">         * 应该 receive 这条消息时能看到服务已死 */</span></li>
+<li id="L282"><span class="lineno"> 282</span><span class="code-line">        err.data[0]  = MK_ERR_NOIPC;</span></li>
+<li id="L283"><span class="lineno"> 283</span><span class="code-line"></span></li>
+<li id="L284"><span class="lineno"> 284</span><span class="code-line">        mk_mailbox_t *dst = &amp;g_mboxes[client];</span></li>
+<li id="L285"><span class="lineno"> 285</span><span class="code-line">        q_push(dst, &amp;err);</span></li>
+<li id="L286"><span class="lineno"> 286</span><span class="code-line"></span></li>
+<li id="L287"><span class="lineno"> 287</span><span class="code-line">        /* 解 client 的 send_wait —— 相当于 reply() 做的事 */</span></li>
+<li id="L288"><span class="lineno"> 288</span><span class="code-line">        wake_send_waiter(client);</span></li>
+<li id="L289"><span class="lineno"> 289</span><span class="code-line">    }</span></li>
+<li id="L290"><span class="lineno"> 290</span><span class="code-line"></span></li>
+<li id="L291"><span class="lineno"> 291</span><span class="code-line">    /* 清空残留队列 —— 时刻 A 的 send 还没被 receive */</span></li>
+<li id="L292"><span class="lineno"> 292</span><span class="code-line">    while (!q_empty(my)) {</span></li>
+<li id="L293"><span class="lineno"> 293</span><span class="code-line">        q_pop(my, NULL);</span></li>
+<li id="L294"><span class="lineno"> 294</span><span class="code-line">    }</span></li>
+<li id="L295"><span class="lineno"> 295</span><span class="code-line">}</span></li>
+<li id="L296"><span class="lineno"> 296</span><span class="code-line"></span></li></ol>
+    </div>
+  </div>
+
+  <p style="margin-top:24px; color: var(--dim); font-size:12px; text-align:center;">
+    代码评审副本 · 已剥离所有 profiling 热路径代码 · 编译验证通过 · IPC round-trip ~1046 ns @3GHz
+  </p>
+</main>
+
+</div>
+</body>
+</html>

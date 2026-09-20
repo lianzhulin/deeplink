@@ -120,8 +120,6 @@ static void echo_task(void *arg)
     }
 
     /* 重置两个 profiler，正式计时 */
-    mk_ipc_prof_reset();
-    mk_tick_prof_reset();
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -133,8 +131,6 @@ static void echo_task(void *arg)
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
     /* dump 两个 breakdown */
-    mk_ipc_prof_dump(N);
-    mk_tick_prof_dump();
     uint64_t total_ns  = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL
                        + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
     uint64_t avg_ns    = total_ns / N;

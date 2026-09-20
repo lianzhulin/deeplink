@@ -83,8 +83,5 @@ bool     mk_ipc_poll(void);
  * 普通任务不应直接调 —— 由 task 模块在 exit 时自动触发。 */
 void     mk_ipc_cleanup_dead_service(uint8_t dead_tid);
 
-/* ── IPC 逐阶段 cycle 剖析（debug 用） ── */
-void mk_ipc_prof_reset(void);
-void mk_ipc_prof_dump(int round_trips);
 
 #endif /* MK_IPC_H */
