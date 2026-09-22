@@ -1,19 +1,28 @@
 /*
- * task.c — TCB 数组、上下文切换、bitmask 调度器
+ * ============================================================================
+ *   task.c — TCB 数组、L2 轻量上下文切换、bitmask 循环调度器实现
+ * ============================================================================
  *
- * L2 轻量上下文：mk_ctx_swap/mk_ctx_load/mk_ctx_init（汇编原语）
- *   - 只保存 callee-saved 6 个寄存器 + rsp = 56B
- *   - 对比 glibc swapcontext：省掉 FPU/SSE 状态、signal mask 等
- * 调度开销 = 入队/出队 一条位指令；选下一个 = tzcnt 硬件指令（x86-64）
- *
- * mk_sched_tick（一次完整 ctx_swap）拆成 7 步:
- *   T0  tcb_check_canary(idler)       兜底：idler canary 每 tick 必查
- *   T1  pick_next()                    __builtin_ctz 选下一个 READY
- *   T2  prev state 检查 + 可选 set_state(prev, READY)
- *   T3  set_state(next, RUNNING)       含 canary + 状态机查表 + state 写
- *   T4  ctx_integrity(next)            rsp 栈范围验证
- *   T5  g_current 赋值
- *   T6  mk_ctx_swap 汇编本体          6 callee-saved 寄存器保存/恢复 + ret
+ *   【实现要点】TCB 用静态数组 g_tasks[32]，每 task 一个槽。
+ *              调度器是 uint32_t g_ready_mask 位掩码 + __builtin_ctz 找下一个。
+ *              pick_next 从 g_current+1 开始找 READY 任务（循环调度），
+ *              wrap 时回最低位。mk_ctx_swap / mk_ctx_load / mk_ctx_init 是
+ *              汇编原语（在 ctx.S 里），这里只负责安全校验。
+ *   【硬化实现】TCB 前后 canary (0xCAFEBABEDEADBEEF / 0x0BADF00DCAFEFACE)，
+ *              tcb_check_canary 每 tick 对 idler 必查一次；
+ *              状态机白名单 g_valid_trans 5×5 查表，所有 state 写必须走
+ *              mk_tcb_set_state（canary 检查 + 状态转换合法性）；
+ *              切换前 tcb_check_ctx_integrity 验证 rsp 在 [stack, stack+size) 内；
+ *              mk_task_exit 先调 mk_ipc_cleanup_dead_service 解所有阻塞 client，
+ *              再 free stack、切下一个（顺序严格，反了会永久 BLOCKED）。
+ *   【热路径】mk_sched_tick（yield/sleep/IPC block 全指向它）、
+ *              mk_sched_ready / mk_sched_unready（IPC send/recv 唤醒时调）、
+ *              pick_next（每 tick 一次）。全部是 O(1)。
+ *   【错误处理】canary 破坏 / 非法状态转换 / rsp 越界 / g_current 越界
+ *              → fprintf + abort（不能 silent corruption）；
+ *              mk_task_create 返回时 tid<0 为 mk_err_t 错误码，由调用者处理。
+
+ * ============================================================================
  */
 #define _GNU_SOURCE
 #include <stdlib.h>

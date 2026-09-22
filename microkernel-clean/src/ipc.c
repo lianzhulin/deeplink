@@ -1,25 +1,30 @@
 /*
- * ipc.c — IPC 硬化版
+ * ============================================================================
+ *   ipc.c — IPC send / receive / reply 硬化版实现
+ * ============================================================================
  *
- * 硬化相对于原型的 5 个改动（+1 个设计简化）：
- *
- * P0  | reply_id per slot：每条 send 分配唯一 token；reply 必须带匹配 token 才能解
- * P0  | 两种独立阻塞原因：send_wait / recv_wait，精确隔离（旧版一个 bool 互相污染）
- * P1  | reply 校验 reply_id 合法性：reply_id 没匹配到任何 inflight → MK_ERR_INVALID
- * P1  | 单一真相源：删 ipc_has_msg / ipc_blocked / ipc_waiter
- * P2  | from / reply_id 强制内核覆盖，用户写的作废
- *
- * 设计简化（2 条）：
- *   1. 删 space_wait：send 是同步的 → 每任务最多 1 条 inflight。
- *      QUEUE_SIZE = MAX_TASKS → mailbox 最多积压 N-1 条，永不溢出。
- *   2. inflight 合并进 reply_id_of_slot：reply_id_of_slot[i] == 0 表示未 inflight，
- *      > 0 就是 reply token。省掉一个 bool[N] 数组，条件更简洁。
- *
- * 精确隔离的阻塞原因为什么重要：
- *   旧版只有一个 ipc_blocked bool + state=BLOCKED。wake_unblocked 不管什么原因都解，
- *   导致 reply 可能误解一个 recv 阻塞的任务（白调度）；receive 广播唤醒又可能解 send
- *   阻塞的任务（状态污染）。拆成两个 bool + 精确匹配唤醒后，每种阻塞只有对应的
- *   那一种原语能解，零误触。
+ *   【实现要点】静态 mk_mailbox_t g_mboxes[32]，每任务一个环形队列。
+ *              三原语 send / receive / reply + 两个精确唤醒 helper
+ *              wake_send_waiter / wake_recv_waiter（每种只解对应的阻塞）。
+ *              新增 cleanup_dead_service：服务者死亡时必须清 inflight +
+ *              给每个 client 推一条 synthetic error reply，否则永久 BLOCKED。
+ *   【硬化实现】P0: reply_id per slot token —— send 分配唯一 token，
+ *              reply 必须带匹配 token；reply_id==0 直接拒不扫 32 slot。
+ *              P0: 两种独立阻塞原因 ipc_send_wait / ipc_recv_wait，
+ *              精确隔离，零互相污染（旧版一个 bool 互相污染）。
+ *              P1: 状态转换合法性 —— BLOCKED → READY 只在 wake_* 里走
+ *              mk_sched_ready（内部含 mk_tcb_set_state）。
+ *              P2: from / reply_id 内核强制覆盖。
+ *              inflight 合并进 reply_id_of_slot：==0 表示未 inflight，>0 就是 token。
+ *   【热路径】mk_ipc_send / mk_ipc_receive / mk_ipc_reply —— 每对通信 2 次调度切换，
+ *              echo benchmark 就是这个路径。q_push / q_pop 是 static inline，
+ *              取模换成位与。
+ *   【错误处理】reply 目标死了 → 对方会收到 reply_id 匹配不到 → MK_ERR_INVALID；
+ *              服务者死亡 → mk_task_exit 里调 cleanup_dead_service 推合成 error reply，
+ *              client 收到后 send_wait 被解，recv 到的 data[0]=MK_ERR_NOIPC；
+ *              所有无效输入 (to >= MAX_TASKS / msg == NULL / reply_id == 0) → 返回 MK_ERR_INVALID。
+
+ * ============================================================================
  */
 #include <string.h>
 #include <stdint.h>

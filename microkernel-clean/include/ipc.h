@@ -1,18 +1,30 @@
 /*
- * ipc.h — IPC 三原语硬化版：send / receive / reply
+ * ============================================================================
+ *   ipc.h — IPC 三原语硬化版：send / receive / reply
+ * ============================================================================
  *
- * 硬化要点（send 是同步的，QUEUE_SIZE = MAX_TASKS，队列永远不可能满，
- * 所以没有背压阻塞——这个不变量由同步 send 语义保证）：
- *   - reply_id per slot：每条 send 入队时内核分配唯一 reply token；
- *     reply 必须携带匹配 token 才能解阻塞，否则返回 MK_ERR_INVALID
- *   - 两种独立阻塞原因：send_wait / recv_wait，精确隔离，零互相污染
- *   - 单一真相源：inbox 空/满统一看 mbox.count，不再有 ipc_has_msg / ipc_blocked
- *   - inflight 合并：reply_id_of_slot[i] == 0 表示未 inflight，
- *     reply_id_of_slot[i] != 0 且等于 reply token 表示该 slot 正在等 reply
- *     省掉一个 inflight[32] 数组
- *
- * 消息体 = 24 字节：tag(2) + reply_id(2) + from(1) + flags(1) + pad(2) + data[4](16)。
- * 微内核哲学：IPC 传小消息，大消息走页共享。
+ *   【架构角色】内核消息传递子系统。提供 send / receive / reply 三原语，
+ *              让独立任务通过 mailbox 环形队列通信。依赖 kernel.h；
+ *              被 task.c / main.c / mm.c 依赖。
+ *   【硬化要点】reply_id per slot token 机制：send 分配唯一 reply token，
+ *              reply 必须带匹配 token 才能解 send 阻塞；
+ *              两种独立阻塞原因 ipc_send_wait / ipc_recv_wait，精确隔离，
+ *              零互相污染；from / reply_id 内核强制覆盖，用户写的作废；
+ *              inflight 状态由 reply_id_of_slot[i]==0 编码，省掉独立 bool[N]。
+ *   【性能要点】环形队列用静态 inline q_push / q_pop，
+ *              取模换成位与 (tail = (slot+1) & (QUEUE_SIZE-1))；
+ *              三原语全部是任务上下文函数，无锁、无 atomics —— 单线程调度器天然串行。
+ *   【不变量】send 是同步的 → 每任务最多 1 条 inflight send；
+ *              QUEUE_SIZE = MK_MAX_TASKS → 一个 mailbox 最多积压 N-1 条，永不溢出；
+ *              reply_id 从 1 开始递增，0 永远是 "未 inflight" 哨兵。
+ *   【约束】reply 必须携带 req.reply_id，否则返回 MK_ERR_INVALID；
+ *              reply_id==0 被直接拒绝 (不会扫描 32 个 slot)；
+ *              send 目标不能是自己。
+ *   【数据结构】mk_msg_t = 24B (tag 2 + reply_id 2 + from 1 + flags 1 + pad 2 + data[4] 16)；
+ *              mk_mailbox_t 含 32 slot + head/tail/count + reply_id_of_slot[32] ≈ 850B。
+ *   【线程安全】全部原语只在任务上下文调用，调度器串行化访问。
+
+ * ============================================================================
  */
 #ifndef MK_IPC_H
 #define MK_IPC_H
