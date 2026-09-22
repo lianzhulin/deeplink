@@ -1,26 +1,4 @@
-/*
- * ============================================================================
- *   mm.c — 内存管理任务实现：静态 arena + first-fit free list
- * ============================================================================
- *
- *   【实现要点】1MB 静态 arena (g_arena[1024*1024]) + mk_block_t 物理顺序链表。
- *              arena_alloc first-fit + split；arena_free 做 16B 对齐检查 +
- *              arena 边界检查 + double-free 检测 + 前后邻块合并。
- *              mm_task 是 while(1){receive; switch(tag); reply} 服务者循环，
- *              识别 MK_MM_TAG_ALLOC / FREE / QUERY 三种 tag。
- *   【硬化实现】arena_free 做三层防御：指针必须 16B 对齐、必须落在 arena 范围、
- *              必须 inuse（防 double-free）。未知 tag 也 reply 解阻塞（否则对端
- *              send 永远挂着）。指针在 data[0..1] 拆成两个 int32 传输 (64-bit
- *              拆低/高 32 位)，接收端再拼回来。
- *   【热路径】mm_task receive → switch → reply 循环；echo benchmark 里 mm 是 reply
- *              方，每次 IPC 往返经过 mm 的一次 receive + reply。
- *   【错误处理】arena_alloc 找不到空闲块 → 返回 NULL，mm_task 把指针 0 返回；
- *              arena_free 非法指针 → fprintf + 静默忽略（返回不崩）；
- *              mk_alloc / mk_free 在当前 tid==MK_TID_MM 时不走 IPC 直接调 arena 函数，
- *              出错行为一致。
 
- * ============================================================================
- */
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -29,19 +7,17 @@
 #include "ipc.h"
 #include "mm.h"
 
-/* ---- Arena ---- */
-#define MK_MM_ARENA_SIZE  (1024 * 1024)   /* 1 MB */
+#define MK_MM_ARENA_SIZE  (1024 * 1024)   
 static unsigned char g_arena[MK_MM_ARENA_SIZE] __attribute__((aligned(16)));
 
 typedef struct mk_block {
-    uint32_t            size;      /* 块数据区大小（不含本 block 头） */
+    uint32_t            size;      
     uint8_t             inuse;
-    struct mk_block    *next;      /* 物理顺序（first-fit 方便） */
+    struct mk_block    *next;      
 } mk_block_t;
 
 #define MK_BLOCK_HEADER_SIZE  sizeof(mk_block_t)
 
-/* ---- Arena 初始化（惰性，第一次用的时候初始化） ---- */
 static bool g_arena_ready = false;
 
 static void arena_init(void)
@@ -57,14 +33,14 @@ static void arena_init(void)
 static void *arena_alloc(size_t n)
 {
     arena_init();
-    /* 16 字节对齐 */
+    
     n = (n + 15) & ~(size_t)15;
     if (n == 0) n = 16;
 
     mk_block_t *cur = (mk_block_t *)g_arena;
     while (cur) {
         if (!cur->inuse && cur->size >= n) {
-            /* 如果剩下的空间还够放一个 header + 16 字节数据，就 split */
+            
             if (cur->size >= n + MK_BLOCK_HEADER_SIZE + 16) {
                 mk_block_t *split = (mk_block_t *)
                     ((unsigned char *)cur + MK_BLOCK_HEADER_SIZE + n);
@@ -86,7 +62,7 @@ static void arena_free(void *p)
 {
     if (!p) return;
 
-    /* P1-4 硬化：对齐检查 —— posix_memalign(16) 分的块，用户不该传不对齐的指针 */
+    
     if (((uintptr_t)p & 0xF) != 0) {
         fprintf(stderr, "[mm] arena_free: pointer %p not 16-byte aligned, rejected\n", p);
         return;
@@ -96,10 +72,10 @@ static void arena_free(void *p)
 
     if ((unsigned char *)b < g_arena || (unsigned char *)b >= g_arena + MK_MM_ARENA_SIZE) {
         fprintf(stderr, "[mm] arena_free: pointer %p out of arena, rejected\n", p);
-        return;   /* 越界，忽略 */
+        return;   
     }
 
-    /* P1-4 硬化：double-free 检测 */
+    
     if (!b->inuse) {
         fprintf(stderr, "[mm] arena_free: double-free at %p (block already free)\n", p);
         return;
@@ -107,12 +83,12 @@ static void arena_free(void *p)
 
     b->inuse = 0;
 
-    /* 向后合并 */
+    
     if (b->next && !b->next->inuse) {
         b->size += MK_BLOCK_HEADER_SIZE + b->next->size;
         b->next = b->next->next;
     }
-    /* 向前合并 —— 需要找前驱 */
+    
     mk_block_t *cur = (mk_block_t *)g_arena;
     while (cur && cur->next != b) cur = cur->next;
     if (cur && !cur->inuse) {
@@ -133,7 +109,6 @@ static int32_t arena_total_used(void)
     return used;
 }
 
-/* ---- mm 任务入口 ---- */
 void mm_task(void *arg)
 {
     (void)arg;
@@ -151,7 +126,7 @@ void mm_task(void *arg)
                   size_t sz = (size_t)req.data[0];
                   void *p = arena_alloc(sz);
                   reply.tag = MK_MM_TAG_ALLOC;
-                  /* 把 64-bit 指针拆成两个 int32 存 */
+                  
                   uint64_t v = (uint64_t)(uintptr_t)p;
                   reply.data[0] = (int32_t)(v & 0xFFFFFFFF);
                   reply.data[1] = (int32_t)((v >> 32) & 0xFFFFFFFF);
@@ -165,7 +140,7 @@ void mm_task(void *arg)
                                ((uint64_t)(uint32_t)req.data[1] << 32);
                   void *p = (void *)(uintptr_t)v;
                   arena_free(p);
-                  /* 必须 reply 解对方 send 的阻塞 —— send 现在是同步原语 */
+                  
                   reply.tag = MK_MM_TAG_FREE;
                   reply.data[0] = 0;
                   reply.reply_id = req.reply_id;
@@ -182,7 +157,7 @@ void mm_task(void *arg)
                   break;
               }
               default:
-                  /* 未知 tag 也要 reply 解阻塞，否则对端 send 永远挂着 */
+                  
                   reply.tag = req.tag;
                   reply.data[0] = -1;
                   reply.reply_id = req.reply_id;
@@ -200,18 +175,17 @@ void mk_mm_start(void)
     }
 }
 
-/* ---- 便捷封装 ---- */
 void *mk_alloc(size_t size)
 {
     if (mk_current_tid() == MK_TID_MM) {
-        /* 自己直接调 arena，不走 IPC */
+        
         return arena_alloc(size);
     }
     mk_msg_t req, reply;
     req.tag = MK_MM_TAG_ALLOC;
     req.data[0] = (int32_t)size;
     mk_ipc_send(MK_TID_MM, &req);
-    /* send 不阻塞，receive 会阻塞等 reply */
+    
     if (mk_ipc_receive(&reply) != MK_OK) return NULL;
     uint64_t v = (uint64_t)(uint32_t)reply.data[0] |
                  ((uint64_t)(uint32_t)reply.data[1] << 32);
@@ -229,9 +203,7 @@ void mk_free(void *ptr)
     uint64_t v = (uint64_t)(uintptr_t)ptr;
     req.data[0] = (int32_t)(v & 0xFFFFFFFF);
     req.data[1] = (int32_t)((v >> 32) & 0xFFFFFFFF);
-    /* send 同步阻塞 → mm 收到 FREE 后 reply ack → send 被唤醒返回。
-     * 但 reply 消息在我的 inbox 队列里，必须 receive 清走，
-     * 否则下次 send 时 inbox 满会让 reply 里触发 q_pop(NULL) 崩。 */
+    
     mk_ipc_send(MK_TID_MM, &req);
     mk_ipc_receive(&dummy);
 }
