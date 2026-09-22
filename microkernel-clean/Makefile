@@ -1,26 +1,26 @@
-# ---- microkernel prototype Makefile ----
+# ---- microkernel core Makefile ----
 CC      = gcc
+AR      = ar
 CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic -O2 -g \
           -Iinclude \
           -Wno-unused-parameter -Wno-unused-function
-LDFLAGS =
 
 SRC_DIR = src
 OBJ_DIR = build
-BIN_DIR = bin
 
 SOURCES = $(wildcard $(SRC_DIR)/*.c)
 ASM     = $(wildcard $(SRC_DIR)/*.S)
 OBJECTS = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SOURCES)) \
           $(patsubst $(SRC_DIR)/%.S,$(OBJ_DIR)/%.o,$(ASM))
-TARGET  = $(BIN_DIR)/mk
 
-.PHONY: all clean run
+LIB     = $(OBJ_DIR)/libmicrokernel.a
 
-all: $(TARGET)
+.PHONY: all clean
 
-$(TARGET): $(OBJECTS) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+all: $(LIB)
+
+$(LIB): $(OBJECTS) | $(OBJ_DIR)
+	$(AR) rcs $@ $^
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -31,11 +31,5 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.S | $(OBJ_DIR)
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 
-$(BIN_DIR):
-	mkdir -p $(BIN_DIR)
-
-run: $(TARGET)
-	$(TARGET)
-
 clean:
-	rm -rf $(OBJ_DIR) $(BIN_DIR)
+	rm -rf $(OBJ_DIR)
