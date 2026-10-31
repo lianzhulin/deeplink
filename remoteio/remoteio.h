@@ -40,7 +40,32 @@ enum {
     OP_CLOSE   = 5,
     OP_LSEEK   = 6,
 
-    /* ====== 按需拉取 + 版本化 专用 ====== */
+    /* ====== 极简 AXI 内存功能模型 (直接 g_shm_base 字节级访问) ======
+     * 帧格式 (大端序):
+     *   请求头: ">BII"  op(1) + addr(4) + length(4)  共 9 字节
+     *   响应头: ">BI"   status(1) + ret_val(4)      共 5 字节
+     *   WRITE/STREAM_WR 请求后追加 length 字节 data
+     *   READ/STREAM_RD 成功响应后追加 ret_val 字节 data
+     *
+     * 单笔 READ/WRITE 最大 4096B; STREAM_RD/WR 无单笔上限。
+     */
+    AXI_OP_READ      = 0,   /* body: [addr][len] → 响应: [status][ret][data] */
+    AXI_OP_WRITE     = 1,   /* body: [addr][len][data] → 响应: [status][ret] */
+    AXI_OP_STREAM_WR = 2,   /* body: [addr][len][data] → 响应: [status][ret] */
+    AXI_OP_STREAM_RD = 3,   /* body: [addr][len] → 响应: [status][ret][data] */
+    AXI_OP_FLUSH     = 4,   /* body: 空 → 响应: [status=OK][ret=0] (无 cache, 空操作) */
+
+    /* AXI 协议响应状态码 (ret_val 在 status=ERR 时是错误码) */
+    AXI_STATUS_OK  = 0,
+    AXI_STATUS_ERR = 1,
+    /* AXI_ERR codes */
+    AXI_ERR_OUT_OF_RANGE  = 0x00,
+    AXI_ERR_OVER_4K       = 0x01,
+    AXI_ERR_FRAME_SHORT   = 0x02,
+    AXI_ERR_UNKNOWN_OP    = 0x03,
+    AXI_ERR_INTERNAL      = 0xFF,
+
+    /* ====== 按需拉取 + 版本化 pack 专用 ====== */
     OP_PACK_META  = 10,   /* 客户端拉 meta: 请求空; 响应 body = [4B n_entries][pack_hdr+entries][4B*n_versions] */
     OP_SEG_READ   = 11,   /* body: [4B seg_idx] → 响应: [8B version][seg_size 字节 body] */
     OP_SEG_VERSION= 12,   /* body: [4B seg_idx] → 响应: [8B version] (快速查询, 不拉 body) */

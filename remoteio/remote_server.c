@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -32,6 +33,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <getopt.h>
+
+/* 网络帧头大小 (AXI 大端序) */
+#define AXI_REQ_HDR  9    /* ">BII"  op(1) + addr(4) + len(4) */
+#define AXI_RESP_HDR 5    /* ">BI"   status(1) + ret(4)      */
+#define AXI_MAX_SINGLE 4096
 
 /* ================================================================
  *  共享内存 pack 初始化
@@ -43,6 +49,9 @@ static size_t g_shm_size = RIO_PACK_SHM_SIZE;
 /* 每段 version —— 任何人修改某段 body 后 +1（服务端权威版本）*/
 static uint32_t *g_seg_versions = NULL;
 static uint32_t  g_n_segs_srv  = 0;
+
+/* shm 访问锁 —— AXI 直接字节级操作和 pack 段写入都要加 */
+static pthread_mutex_t g_shm_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * 在 shm 里写入默认的测试 pack 数据（和 test_pack_client.c / gen_pack.py 预期一致）。
@@ -300,41 +309,206 @@ static void handle_write_seg(int cli, const uint8_t *body, uint32_t len) {
     uint64_t seg_off = entry->offset;
     uint32_t seg_sz  = (uint32_t)entry->size;
 
-    /* 安全：最多写 seg_sz 字节 */
+    pthread_mutex_lock(&g_shm_mutex);
     uint32_t n = dlen < seg_sz ? dlen : seg_sz;
     memcpy(g_shm_base + seg_off, body + off, n);
-    g_seg_versions[idx]++;  /* 修改后 version++ —— 客户端下次 OP_SEG_VERSION 就能发现 */
+    g_seg_versions[idx]++;
+    pthread_mutex_unlock(&g_shm_mutex);
 
     send_resp(cli, OP_ACK, 0, NULL, 0);
     printf("[srv] OP_WRITE_SEG seg[%u] %s ← %u bytes  version→%u\n",
            idx, entry->vpath, n, g_seg_versions[idx]);
 }
 
+/* ================================================================
+ *  AXI 极简内存协议 (大端 ">BII" / ">BI" 帧)
+ *  直接操作 g_shm_base 字节级读写, 无突发/无时序/无波形
+ *  单笔 READ/WRITE <= 4096B; STREAM_* 无单笔上限
+ * ================================================================ */
+
+/* --- AXI 响应发送 --- */
+static void send_axi_ok(int cli, uint32_t ret_val) {
+    uint8_t hdr[AXI_RESP_HDR];
+    hdr[0] = AXI_STATUS_OK;
+    hdr[1] = (ret_val >> 24) & 0xFF;
+    hdr[2] = (ret_val >> 16) & 0xFF;
+    hdr[3] = (ret_val >>  8) & 0xFF;
+    hdr[4] =  ret_val        & 0xFF;
+    send_all(cli, hdr, AXI_RESP_HDR);
+}
+
+static void send_axi_ok_data(int cli, uint32_t ret_val, const void *data) {
+    send_axi_ok(cli, ret_val);
+    if (ret_val && data) send_all(cli, data, ret_val);
+}
+
+static void send_axi_err(int cli, uint8_t err_code) {
+    uint8_t hdr[AXI_RESP_HDR];
+    hdr[0] = AXI_STATUS_ERR;
+    hdr[1] = 0; hdr[2] = 0; hdr[3] = 0; hdr[4] = err_code;
+    send_all(cli, hdr, AXI_RESP_HDR);
+}
+
+/* --- AXI → seg version 联动 ---
+ * AXI 写入可能覆盖 pack 某段 body —— 需要 bump 对应 seg 的 version
+ * 只有命中 entry.offset..entry.offset+entry.size 范围时才 bump */
+static void bump_seg_version_for_addr_range(uint64_t addr, uint32_t len) {
+    if (g_n_segs_srv == 0) return;
+    const rio_pack_entry_t *entries = (const rio_pack_entry_t *)(g_shm_base + sizeof(rio_pack_hdr_t));
+    uint64_t end = addr + len;
+    for (uint32_t i = 0; i < g_n_segs_srv; i++) {
+        uint64_t es = entries[i].offset;
+        uint64_t ee = es + entries[i].size;
+        /* 区间交叉: [addr, end) 和 [es, ee) 有交集 */
+        if (addr < ee && end > es) {
+            g_seg_versions[i]++;
+        }
+    }
+}
+
+/* ================================================================
+ *  serve_client — 帧自动检测
+ *  先读 1 字节:
+ *    <= 4  (AXI opcodes) → AXI 帧 ">BII" / ">BI" 路径
+ *    0x52.. (RIO_MAGIC 首字节 'R') → rio_hdr_t 路径
+ * ================================================================ */
+
+static void discard_sock(int cli, uint32_t n) {
+    uint8_t junk[256];
+    uint32_t got = 0;
+    while (got < n) {
+        uint32_t todo = n - got;
+        if (todo > sizeof(junk)) todo = sizeof(junk);
+        if (recv_all(cli, junk, todo) < 0) return;
+        got += todo;
+    }
+}
+
+/* ================================================================
+ *  serve_client — 帧自动检测
+ *  先读 1 字节:
+ *    <= 4  (AXI opcodes) → AXI 帧 ">BII" / ">BI" 路径
+ *    0x31+ (RIO_MAGIC 首字节 0x31 on LE x86) → rio_hdr_t 路径
+ * ================================================================ */
+
 static void serve_client(int cli) {
-    rio_hdr_t hdr;
     while (1) {
-        if (recv_all(cli, &hdr, sizeof(hdr)) < 0) break;
-        if (hdr.magic != RIO_MAGIC) {
-            send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0);
-            break;
-        }
-        uint8_t *body = NULL;
-        if (hdr.body_len) {
-            body = (uint8_t *)malloc(hdr.body_len);
-            if (!body) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); break; }
-            if (recv_all(cli, body, hdr.body_len) < 0) { free(body); break; }
-        }
-        switch (hdr.opcode) {
-            case OP_PACK_META:   handle_pack_meta(cli); break;
-            case OP_SEG_VERSION: handle_seg_version(cli, body, hdr.body_len); break;
-            case OP_SEG_READ:    handle_seg_read(cli, body, hdr.body_len); break;
-            case OP_WRITE_SEG:   handle_write_seg(cli, body, hdr.body_len); break;
+        uint8_t first;
+        if (recv_all(cli, &first, 1) < 0) break;
+
+        if (first <= 4) {
+            /* ---- AXI 帧 ---- */
+            uint8_t rest[AXI_REQ_HDR - 1];
+            if (recv_all(cli, rest, sizeof(rest)) < 0) break;
+            uint8_t  op   = first;
+            uint32_t addr = ((uint32_t)rest[0] << 24) | ((uint32_t)rest[1] << 16)
+                          | ((uint32_t)rest[2] <<  8) |  (uint32_t)rest[3];
+            uint32_t len  = ((uint32_t)rest[4] << 24) | ((uint32_t)rest[5] << 16)
+                          | ((uint32_t)rest[6] <<  8) |  (uint32_t)rest[7];
+
+            int disconn = 0;
+            switch (op) {
+            case AXI_OP_FLUSH:
+                send_axi_ok(cli, 0);
+                printf("[srv] AXI FLUSH\n"); break;
+
+            case AXI_OP_READ:
+                if (len > AXI_MAX_SINGLE) { send_axi_err(cli, AXI_ERR_OVER_4K); break; }
+                if ((uint64_t)addr + len > g_shm_size) { send_axi_err(cli, AXI_ERR_OUT_OF_RANGE); break; }
+                {
+                    uint8_t *buf = (uint8_t *)malloc(len);
+                    if (!buf) { send_axi_err(cli, AXI_ERR_INTERNAL); break; }
+                    pthread_mutex_lock(&g_shm_mutex);
+                    memcpy(buf, g_shm_base + addr, len);
+                    pthread_mutex_unlock(&g_shm_mutex);
+                    send_axi_ok_data(cli, len, buf);
+                    free(buf);
+                }
+                printf("[srv] AXI READ  0x%08x len=%u\n", addr, len); break;
+
+            case AXI_OP_WRITE:
+                if (len > AXI_MAX_SINGLE) { discard_sock(cli, len); send_axi_err(cli, AXI_ERR_OVER_4K); break; }
+                if ((uint64_t)addr + len > g_shm_size) { discard_sock(cli, len); send_axi_err(cli, AXI_ERR_OUT_OF_RANGE); break; }
+                {
+                    uint8_t *data = (uint8_t *)malloc(len);
+                    if (!data) { send_axi_err(cli, AXI_ERR_INTERNAL); break; }
+                    if (recv_all(cli, data, len) < 0) { free(data); disconn = 1; break; }
+                    pthread_mutex_lock(&g_shm_mutex);
+                    memcpy(g_shm_base + addr, data, len);
+                    bump_seg_version_for_addr_range(addr, len);
+                    pthread_mutex_unlock(&g_shm_mutex);
+                    send_axi_ok(cli, len);
+                    free(data);
+                }
+                printf("[srv] AXI WRITE 0x%08x len=%u\n", addr, len); break;
+
+            case AXI_OP_STREAM_RD:
+                if (len == 0) { send_axi_ok(cli, 0); break; }
+                if ((uint64_t)addr + len > g_shm_size) { send_axi_err(cli, AXI_ERR_OUT_OF_RANGE); break; }
+                {
+                    uint8_t *buf = (uint8_t *)malloc(len);
+                    if (!buf) { send_axi_err(cli, AXI_ERR_INTERNAL); break; }
+                    pthread_mutex_lock(&g_shm_mutex);
+                    memcpy(buf, g_shm_base + addr, len);
+                    pthread_mutex_unlock(&g_shm_mutex);
+                    send_axi_ok_data(cli, len, buf);
+                    free(buf);
+                }
+                printf("[srv] AXI STREAM_RD 0x%08x len=%u\n", addr, len); break;
+
+            case AXI_OP_STREAM_WR:
+                if (len == 0) { send_axi_ok(cli, 0); break; }
+                if ((uint64_t)addr + len > g_shm_size) { discard_sock(cli, len); send_axi_err(cli, AXI_ERR_OUT_OF_RANGE); break; }
+                {
+                    uint8_t *data = (uint8_t *)malloc(len);
+                    if (!data) { send_axi_err(cli, AXI_ERR_INTERNAL); break; }
+                    if (recv_all(cli, data, len) < 0) { free(data); disconn = 1; break; }
+                    pthread_mutex_lock(&g_shm_mutex);
+                    memcpy(g_shm_base + addr, data, len);
+                    bump_seg_version_for_addr_range(addr, len);
+                    pthread_mutex_unlock(&g_shm_mutex);
+                    send_axi_ok(cli, len);
+                    free(data);
+                }
+                printf("[srv] AXI STREAM_WR 0x%08x len=%u\n", addr, len); break;
+
             default:
-                fprintf(stderr, "[srv] unknown opcode %u\n", hdr.opcode);
+                send_axi_err(cli, AXI_ERR_UNKNOWN_OP);
+                printf("[srv] AXI 未知 op=%u\n", op); break;
+            }
+            if (disconn) break;
+
+        } else {
+            /* ---- rio_hdr_t 帧 ----
+             * 把 first 字节 prepend 回去, 拼成完整 12B hdr 再 memcpy */
+            uint8_t raw[sizeof(rio_hdr_t)];
+            raw[0] = first;
+            if (recv_all(cli, raw + 1, sizeof(raw) - 1) < 0) break;
+            rio_hdr_t hdr;
+            memcpy(&hdr, raw, sizeof(hdr));
+
+            if (hdr.magic != RIO_MAGIC) {
                 send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0);
                 break;
+            }
+            uint8_t *body = NULL;
+            if (hdr.body_len) {
+                body = (uint8_t *)malloc(hdr.body_len);
+                if (!body) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); break; }
+                if (recv_all(cli, body, hdr.body_len) < 0) { free(body); break; }
+            }
+            switch (hdr.opcode) {
+                case OP_PACK_META:   handle_pack_meta(cli); break;
+                case OP_SEG_VERSION: handle_seg_version(cli, body, hdr.body_len); break;
+                case OP_SEG_READ:    handle_seg_read(cli, body, hdr.body_len); break;
+                case OP_WRITE_SEG:   handle_write_seg(cli, body, hdr.body_len); break;
+                default:
+                    fprintf(stderr, "[srv] unknown opcode %u\n", hdr.opcode);
+                    send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0);
+                    break;
+            }
+            free(body);
         }
-        free(body);
     }
 }
 
