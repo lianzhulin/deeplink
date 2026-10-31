@@ -1,59 +1,81 @@
 /*
- * rio_pack.h — 多虚拟文件 → 单远程大文件 合并层
+ * rio_pack.h — pack 多虚拟文件自描述模块
  *
- * 设计原则：libremoteio.so 本身**不携带任何** pack.bin 内部布局信息。
- * 具体的 虚拟路径 → offset/size 映射由外部（业务代码）通过
- * rio_pack_register() 在运行时注入。
+ * pack.bin 自描述格式（pack 文件本身包含头部，无需外部 INI 或运行时 register）：
  *
- * 典型用法（业务程序 main 开头）:
- *   rio_pack_set_pack_file("/remote/pack.bin");
- *   rio_pack_register("/virtual/config.txt", 0,    64);
- *   rio_pack_register("/virtual/header.bin", 64,   128);
- *   rio_pack_register("/virtual/records.log", 192, 256);
- * 然后 open("/virtual/config.txt") 自动走 pack 模式。
+ *   offset 0:   rio_pack_hdr_t (固定 256 字节)
+ *   offset 256: rio_pack_entry_t[n_entries] (每项 144 字节)
+ *   offset H+E: pack body (各虚拟文件实际内容)
+ *
+ * 每个 entry 的 offset 是 pack.bin 内的**绝对偏移**（从文件头算起）。
+ *
+ * 加载流程（懒加载）：
+ *   第一次 rio_pack_lookup() 被调用时 → rio_connect() → rio_do_open(pack_file)
+ *   → rio_do_read(hdr) → 校验 magic → rio_do_read(entries[]) → 填充内部表
+ *
+ * 业务代码集成：
+ *   rio_pack_set_pack_file("/remote/pack.bin");  // 可选，覆盖默认路径
+ *   // 然后 open("/virtual/config.txt") — 自动从 pack.bin 头部查映射
  */
 
 #ifndef RIO_PACK_H
 #define RIO_PACK_H
 
 #include "remoteio.h"
+#include <stdint.h>
 
-/* 服务端合并后的 pack 大文件默认路径 —— 仅作为 fallback，
- * 业务代码应通过 rio_pack_set_pack_file() 运行时覆盖 */
+/* 默认 pack 大文件在服务端的路径 —— 可通过 rio_pack_set_pack_file 或编译宏覆盖 */
 #ifndef RIO_PACK_FILE
 #define RIO_PACK_FILE  "/remote/pack.bin"
 #endif
 
-/* 一个虚拟文件 → pack 大文件里的一段 */
+/* pack.bin 文件魔数 + 版本 */
+#define RIO_PACK_MAGIC     "RIOPACK!"
+#define RIO_PACK_MAGIC_LEN 8
+#define RIO_PACK_VERSION   1
+
+/* ---- pack.bin 二进制格式 ---- */
+
+/* pack 文件头（固定 256 字节）*/
 typedef struct {
-    const char *vpath;     /* 虚拟路径：/virtual/config.txt */
-    uint64_t    offset;    /* 在 pack_file 里的起始偏移 */
-    uint64_t    size;      /* 该虚拟文件最大长度（0 = 不限）*/
+    char     magic[8];       /* "RIOPACK!" */
+    uint32_t version;        /* 格式版本号，当前 = 1 */
+    uint32_t n_entries;      /* 虚拟文件段数量 */
+    uint64_t reserved;       /* 保留字段，置 0 */
+    uint8_t  pad[232];       /* 填充到 256 字节 */
+} rio_pack_hdr_t;            /* 8+4+4+8+232 = 256 */
+
+/* 每个虚拟文件段描述（固定 144 字节） */
+typedef struct {
+    char     vpath[128];     /* 虚拟路径，\0 结尾，不足补 \0 */
+    uint64_t offset;         /* 在 pack.bin 内的起始偏移（从文件头算起）*/
+    uint64_t size;           /* 虚拟文件最大长度（0 = 不限）*/
 } rio_pack_entry_t;
 
-/* ---- 运行时注册 API ---- */
+/* ---- 运行时 API ---- */
 
-/* 覆盖默认 pack_file 路径（业务代码通常只需要调一次）*/
+/* 覆盖默认 pack_file 路径（可选 —— 如果用默认 /remote/pack.bin 就不用调）*/
 void rio_pack_set_pack_file(const char *pack_file);
 
-/* 注册一个虚拟文件段。返回 0=成功，-1=dup 或内存不足 */
+/* 手动注册一个虚拟文件段（覆盖自动加载的映射 —— 调试或热修时用）*/
 int rio_pack_register(const char *vpath, uint64_t offset, uint64_t size);
 
-/* 清空所有已注册的段（测试或热重载时用）*/
+/* 清空所有映射表 */
 void rio_pack_clear(void);
 
 /* ---- 查询 API ---- */
 
-/* 查虚拟路径是否在已注册的映射表里，返回 NULL 表示未注册 */
+/* 查虚拟路径是否已注册（首次调用时自动从 pack.bin 懒加载）*/
 const rio_pack_entry_t *rio_pack_lookup(const char *vpath);
 
-/* 获取当前 pack_file 路径（只读）*/
+/* 当前 pack_file 路径 */
 const char *rio_pack_pack_file(void);
 
 /* 是否已注册至少一个段 */
 int rio_pack_is_enabled(void);
 
-/* constructor 内部自动调，业务代码不需要调 */
-void rio_pack_init(void);
+/* ---- 内部 ---- */
+void rio_pack_init(void);        /* constructor 调 */
+int  rio_pack_autoload(void);    /* 从 pack.bin 头部加载映射（懒加载入口）*/
 
 #endif /* RIO_PACK_H */

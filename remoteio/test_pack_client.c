@@ -248,17 +248,17 @@ static void test_independent_pos(void) {
 }
 
 int main(void) {
-    /* ---- 关键：运行时注入 pack 映射（libremoteio.so 本身不含这些信息）----
-     * 业务代码在任何 open() 前调用即可。
-     * gen_pack.py 生成的 pack.bin 段信息：
-     *   seg1 config.txt  offset=0,   size=64
-     *   seg2 header.bin  offset=64,  size=128
-     *   seg3 records.log offset=192, size=256
+    /* pack.bin 自描述 —— 业务代码零配置，无需 register()
+     * 第一次 open("/virtual/xxx") 时，libremoteio 自动从 pack.bin 头部加载映射表。
      */
-    rio_pack_set_pack_file("/remote/pack.bin");
-    rio_pack_register("/virtual/config.txt",   0,    64);
-    rio_pack_register("/virtual/header.bin",   64,   128);
-    rio_pack_register("/virtual/records.log",  192,  256);
+
+    /* 可选：覆盖默认 pack_file 路径 —— 默认就是 /remote/pack.bin
+     * rio_pack_set_pack_file("/remote/pack.bin");
+     */
+
+    printf("RIO_PACK_FILE (default): %s\n", rio_pack_pack_file());
+    printf("rio_pack_is_enabled() before any open: %d (should be 0)\n",
+           rio_pack_is_enabled());
 
     test_read_three_files();
     test_lseek_independent();
@@ -267,6 +267,10 @@ int main(void) {
     test_pread_pwrite();
     test_fopen_pack();
     test_independent_pos();
+
+    /* 最后确认 autoload 成功 —— g_entries 里有 3 条 */
+    printf("rio_pack_is_enabled() after tests: %d (should be 1)\n",
+           rio_pack_is_enabled());
 
     printf("\n=== Summary: %d passed, %d failed ===\n", tp, tf);
     return tf == 0 ? 0 : 1;
