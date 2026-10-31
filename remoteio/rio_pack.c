@@ -65,40 +65,61 @@ size_t   rio_pack_shm_size(void) { return g_shm_size; }
 
 /* ---- 懒加载 ----
  *
- * 由 rio_pack_lookup 首次调用触发。流程：
- *   1) 发 OP_SHM_OPEN 给服务端 → 让服务端创建/确认 shm 段
- *   2) 客户端自己 shm_open(O_RDWR) + mmap
- *   3) memcpy 读 header → 校验 magic/version
- *   4) memcpy 读 entries → 填充 g_entries[]
+ * 跨机器全量同步流程：
+ *   1) 发 OP_SHM_OPEN 给远程服务端 → 拿到服务端的 16MB 全量 pack 数据（malloc buffer）
+ *   2) 客户端本地 shm_open(O_RDWR|O_CREAT|O_TRUNC) + ftruncate(16MB) + mmap
+ *   3) memcpy(下载的 pack 数据, 本地 shm base, 16MB)
+ *   4) 从本地 mmap 读 header → 校验 magic/version
+ *   5) 从本地 mmap 读 entries → 填充 g_entries[]
+ *
+ * 核心优势：一次网络传输（16MB），之后所有虚拟文件 I/O 都是本地 memcpy —— 零网络零磁盘。
  */
 int rio_pack_autoload(void) {
     if (g_loaded) return g_count;
     g_loaded = 1;
 
-    RIO_LOG("rio_pack_autoload: requesting shm init from server...");
-    if (rio_do_shm_open_req(RIO_PACK_SHM_NAME) < 0) {
-        RIO_LOG("rio_pack_autoload: server shm_open failed");
+    RIO_LOG("rio_pack_autoload: 向 %s:%d 全量下载 pack 数据...",
+            RIO_REMOTE_HOST, RIO_REMOTE_PORT);
+    uint8_t *pack_data = NULL;
+    uint32_t pack_size = 0;
+    if (rio_do_shm_open_req(RIO_PACK_SHM_NAME, &pack_data, &pack_size) < 0 || !pack_data) {
+        RIO_LOG("rio_pack_autoload: 从服务端下载 pack 数据失败");
         return -1;
     }
+    RIO_LOG("rio_pack_autoload: 下载 %u bytes 完成", pack_size);
 
-    /* 客户端 mmap 同一段 shm */
-    int fd = shm_open(RIO_PACK_SHM_NAME, O_RDWR, 0);
+    /* 客户端本地创建同名 shm（注意：和远程机器上的 shm 是完全独立的 —— 跨机器 POSIX shm 不互通）*/
+    int fd = shm_open(RIO_PACK_SHM_NAME, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         RIO_LOG("rio_pack_autoload: shm_open(%s) failed: %s",
                 RIO_PACK_SHM_NAME, strerror(errno));
+        free(pack_data);
         return -1;
     }
-    uint8_t *base = (uint8_t *)mmap(NULL, RIO_PACK_SHM_SIZE,
+    if (ftruncate(fd, (off_t)pack_size) < 0) {
+        RIO_LOG("rio_pack_autoload: ftruncate failed: %s", strerror(errno));
+        close(fd);
+        free(pack_data);
+        return -1;
+    }
+
+    uint8_t *base = (uint8_t *)mmap(NULL, pack_size,
                                      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (base == MAP_FAILED) {
         RIO_LOG("rio_pack_autoload: mmap failed: %s", strerror(errno));
+        free(pack_data);
         return -1;
     }
+
+    /* 把从服务端下载的 pack 数据写入本地 shm —— 之后所有 I/O 都对这块本地 mmap */
+    memcpy(base, pack_data, pack_size);
+    free(pack_data);
+
     g_shm_base = base;
-    g_shm_size = RIO_PACK_SHM_SIZE;
-    RIO_LOG("rio_pack_autoload: mmap %s at %p size=%zu",
-            RIO_PACK_SHM_NAME, (void *)base, RIO_PACK_SHM_SIZE);
+    g_shm_size = pack_size;
+    RIO_LOG("rio_pack_autoload: 本地 shm mmap %s at %p size=%u  (数据已从远程同步)",
+            RIO_PACK_SHM_NAME, (void *)base, pack_size);
 
     /* 从 shm 基址读 header */
     const rio_pack_hdr_t *hdr = (const rio_pack_hdr_t *)base;

@@ -216,9 +216,12 @@ static int send_resp(int cli, uint32_t opcode, uint64_t ret_val,
 }
 
 /*
- * OP_SHM_OPEN：客户端请求确认 shm 段存在。
+ * OP_SHM_OPEN：客户端全量下载 pack 数据（跨机器模式）。
  * body: [4B plen][shm_name_str]
- * 我们只需要返回 OP_ACK(0) —— 客户端之后自己 shm_open + mmap。
+ *
+ * 响应: [8B shm_size][pack 数据 (g_shm_size 字节)]
+ *   ret_val 填 g_shm_size（客户端校验用）
+ *   extra/extra_len 是 g_shm_base/g_shm_size —— 整个 16MB shm 一次性 dump 出去
  */
 static void handle_shm_open(int cli, const uint8_t *body, uint32_t len) {
     if (len < 4) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); return; }
@@ -229,17 +232,18 @@ static void handle_shm_open(int cli, const uint8_t *body, uint32_t len) {
     size_t copy = plen < sizeof(name) ? plen - 1 : sizeof(name) - 1;
     memcpy(name, body + 4, copy);
 
-    /* 确保 shm 还在（防止被误 unlink） */
+    /* 确保 shm 还在（防止被误 unlink） —— 存在性校验 */
     int fd = shm_open(name, O_RDWR, 0);
-    if (fd >= 0) {
-        close(fd);
-        send_resp(cli, OP_ACK, 0, NULL, 0);
-    } else {
-        fprintf(stderr, "[srv] handle_shm_open: shm_open(%s) failed: %s\n",
-                name, strerror(errno));
+    if (fd >= 0) close(fd);
+    if (!g_shm_base) {
+        fprintf(stderr, "[srv] handle_shm_open: g_shm_base is NULL\n");
         send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0);
+        return;
     }
-    printf("[srv] OP_SHM_OPEN %s -> %s\n", name, fd >= 0 ? "ACK" : "ERR");
+
+    RIO_LOG("[srv] dump %s → 客户端 (size=%zu bytes)...", name, g_shm_size);
+    send_resp(cli, OP_ACK, (uint64_t)g_shm_size, g_shm_base, (uint32_t)g_shm_size);
+    printf("[srv] OP_SHM_OPEN %s -> ACK (%zu bytes dumped)\n", name, g_shm_size);
 }
 
 static void serve_client(int cli) {

@@ -1,10 +1,14 @@
 /*
  * remoteio.h — LD_PRELOAD 远程文件 I/O 劫持库 公共接口
  *
- * 当前版本仅支持 pack 模式：
- *   业务代码在运行时通过 rio_pack_register() 注册虚拟路径 → offset/size 映射，
- *   libremoteio 将对虚拟路径的 open/read/write/lseek 翻译为对服务端 pack_file 的
- *   带偏移操作。
+ * 当前版本仅支持 pack 模式（跨机器全量同步 + 本地 memcpy）：
+ *   服务端启动时创建 16MB POSIX 共享内存 (RIO_PACK_SHM_NAME)，
+ *   写入自描述 pack 格式头部 (rio_pack_hdr_t + entries + body)。
+ *   客户端首次 open() 虚拟路径时：
+ *     → OP_SHM_OPEN 请求服务端 dump 整个 16MB shm 到 TCP 响应
+ *     → 客户端本地创建同名 POSIX shm + mmap + memcpy 写入
+ *     → 之后所有虚拟文件 I/O 都是本地 memcpy —— 零网络、零磁盘。
+ *   业务代码零配置，直接 open("/virtual/config.txt") 即可。
  *
  * 协议格式（二进制，网络字节序）：
  *   [4B magic][4B opcode][4B body_len][body...]
@@ -16,10 +20,17 @@
  *   OP_WRITE   = 4   body: [4B handle][4B count][data...]
  *   OP_CLOSE   = 5   body: [4B handle]
  *   OP_LSEEK   = 6   body: [4B handle][8B offset][4B whence]
+ *   OP_SHM_OPEN = 10 body: [4B name_len][shm_name\0]  ← dump 整个 shm
  *
  * 响应格式：
- *   OP_ACK / OP_ERR  通用：[8B ret_val]
- *   OP_READ 特例     [4B ret_val][data...]
+ *   OP_ACK / OP_ERR  通用: [8B ret_val]  可选追加 body
+ *   OP_SHM_OPEN 特例: [8B shm_size][shm_size 字节 pack 数据]
+ *
+ * 关键架构约束：
+ *   - POSIX 共享内存是单机内核对象，跨机器**无法共享**
+ *   - 所以"同机模式下客户端直接 shm_open + mmap 同一段"不可行
+ *   - 改为：一次 TCP 全量同步 16MB → 客户端本地 shm + memcpy
+ *   - 之后零网络零磁盘，与同机模式的 I/O 层行为完全一致
  */
 
 #ifndef REMOTEIO_H
@@ -111,8 +122,10 @@ typedef struct {
 int  rio_connect(void);
 void rio_disconnect(void);
 
-/* OP_SHM_OPEN: 请求服务端初始化 shm 段，返回 0 成功 */
-int  rio_do_shm_open_req(const char *shm_name);
+/* OP_SHM_OPEN: 从远程服务端全量下载 pack 数据（服务端 dump 它的 16MB shm）
+ * 成功时 *out_pack_data 是 malloc 的 buffer（调用方 free），*out_pack_size 是长度 */
+int  rio_do_shm_open_req(const char *shm_name,
+                         uint8_t **out_pack_data, uint32_t *out_pack_size);
 
 /* （保留的通用协议函数，shm 模式下不使用） */
 int  rio_do_open(const char *path, int flags, mode_t mode, remote_handle_t *out);
