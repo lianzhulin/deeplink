@@ -1,20 +1,24 @@
 /*
- * libremoteio.c — LD_PRELOAD 劫持主模块（pack 模式专用）
+ * libremoteio.c — LD_PRELOAD 劫持主模块（共享内存 pack 模式专用）
+ *
+ * 用户端的 pack 存储是服务端提前初始化好的 16MB POSIX 共享内存段，
+ * 客户端第一次 open() 虚拟路径时，rio_pack_autoload() 会：
+ *   1) rio_do_shm_open_req() 让服务端确认/初始化 shm
+ *   2) 本地 shm_open() + mmap() 拿到 shm_base
+ *   3) 从 shm 头部读 header + entries，填充 g_entries[]
+ *
+ * 之后所有虚拟文件 I/O 都是对本地 mmap 区域 memcpy —— 零网络、零磁盘。
  *
  * 劫持清单：
- *   系统调用层： open, openat, open64, openat64
+ *   系统调用层：open, openat, open64, openat64
  *               read, write, close, lseek, lseek64, pread, pwrite, pread64, pwrite64
- *   标准库层  ： fopen, fopen64, freopen, fdopen, fileno,
+ *   标准库层  ：fopen, fopen64, freopen, fdopen, fileno,
  *               fread, fwrite, fclose, fseek, ftell, rewind, fflush
  *
- * 策略：
- *   - constructor 用 dlsym(RTLD_NEXT, ...) 拉 glibc 真实符号
- *   - 对每个被劫持函数：
- *     · 先判断 —— path/fd 是否属于 pack 虚拟文件
- *     · pack 命中 → 翻译为对服务端 pack_file 的带偏移 I/O
- *     · 未命中   → 原样透传给 real_*
- *   - pack 模式下 read/write 每次 lseek(pack_rh, pack_offset + pack_pos)，
- *     lseek 只更新客户端 track 的 pack_pos（不动远程 rh 位置）
+ * 关键约束：
+ *   - constructor(65534) 必须比 glibc init 稍晚，但比应用 init 早
+ *   - 必须劫持 __open_2 / __openat_2 等 glibc 版本化符号
+ *   - libremoteio.so 本身绝不能硬编码任何 /virtual/xxx 业务路径
  */
 
 #define _GNU_SOURCE
@@ -35,53 +39,49 @@
 #include <sys/uio.h>
 
 /* ================================================================
- *  真实函数指针（constructor 中通过 dlsym(RTLD_NEXT) 初始化）
+ *  真实 glibc 函数指针（constructor 中通过 dlsym(RTLD_NEXT) 初始化）
  * ================================================================ */
 
-/* --- 系统调用层 --- */
-typedef int   (*real_open_t)(const char *, int, ...);
-typedef int   (*real_openat_t)(int, const char *, int, ...);
-typedef int   (*real_open64_t)(const char *, int, ...);
-typedef int   (*real_openat64_t)(int, const char *, int, ...);
+typedef int     (*real_open_t)(const char *, int, ...);
+typedef int     (*real_openat_t)(int, const char *, int, ...);
+typedef int     (*real_open64_t)(const char *, int, ...);
+typedef int     (*real_openat64_t)(int, const char *, int, ...);
 
 typedef ssize_t (*real_read_t)(int, void *, size_t);
 typedef ssize_t (*real_write_t)(int, const void *, size_t);
-typedef int   (*real_close_t)(int);
-typedef off_t (*real_lseek_t)(int, off_t, int);
+typedef int     (*real_close_t)(int);
+typedef off_t   (*real_lseek_t)(int, off_t, int);
 typedef ssize_t (*real_pread_t)(int, void *, size_t, off_t);
 typedef ssize_t (*real_pwrite_t)(int, const void *, size_t, off_t);
 
-/* --- stat 家族 --- */
 typedef int (*real_fstat_t)(int, struct stat *);
 typedef int (*real_newfstatat_t)(int, const char *, struct stat *, int);
 typedef int (*real_stat_t)(const char *, struct stat *);
 typedef int (*real_lstat_t)(const char *, struct stat *);
 
-/* --- 标准库 FILE* 层 --- */
-typedef FILE* (*real_fopen_t)(const char *, const char *);
-typedef FILE* (*real_fopen64_t)(const char *, const char *);
-typedef FILE* (*real_freopen_t)(const char *, const char *, FILE *);
-typedef FILE* (*real_fdopen_t)(int, const char *);
-typedef int   (*real_fileno_t)(FILE *);
-typedef size_t(*real_fread_t)(void *, size_t, size_t, FILE *);
-typedef size_t(*real_fwrite_t)(const void *, size_t, size_t, FILE *);
-typedef int   (*real_fclose_t)(FILE *);
-typedef int   (*real_fseek_t)(FILE *, long, int);
-typedef long  (*real_ftell_t)(FILE *);
-typedef int   (*real_rewind_t)(FILE *);
-typedef int   (*real_fflush_t)(FILE *);
+typedef FILE*   (*real_fopen_t)(const char *, const char *);
+typedef FILE*   (*real_fopen64_t)(const char *, const char *);
+typedef FILE*   (*real_freopen_t)(const char *, const char *, FILE *);
+typedef FILE*   (*real_fdopen_t)(int, const char *);
+typedef int     (*real_fileno_t)(FILE *);
+typedef size_t  (*real_fread_t)(void *, size_t, size_t, FILE *);
+typedef size_t  (*real_fwrite_t)(const void *, size_t, size_t, FILE *);
+typedef int     (*real_fclose_t)(FILE *);
+typedef int     (*real_fseek_t)(FILE *, long, int);
+typedef long    (*real_ftell_t)(FILE *);
+typedef int     (*real_rewind_t)(FILE *);
+typedef int     (*real_fflush_t)(FILE *);
 
-/* 全局指针 */
-static real_open_t    real_open    = NULL;
-static real_openat_t  real_openat  = NULL;
-static real_open64_t  real_open64  = NULL;
+static real_open_t     real_open     = NULL;
+static real_openat_t   real_openat   = NULL;
+static real_open64_t   real_open64   = NULL;
 static real_openat64_t real_openat64 = NULL;
-static real_read_t    real_read    = NULL;
-static real_write_t   real_write   = NULL;
-static real_close_t   real_close   = NULL;
-static real_lseek_t   real_lseek   = NULL;
-static real_pread_t   real_pread   = NULL;
-static real_pwrite_t  real_pwrite  = NULL;
+static real_read_t     real_read     = NULL;
+static real_write_t    real_write    = NULL;
+static real_close_t    real_close    = NULL;
+static real_lseek_t    real_lseek    = NULL;
+static real_pread_t    real_pread    = NULL;
+static real_pwrite_t   real_pwrite   = NULL;
 
 static real_fstat_t       real_fstat       = NULL;
 static real_newfstatat_t  real_newfstatat  = NULL;
@@ -107,13 +107,14 @@ static real_fflush_t  real_fflush  = NULL;
 
 #define RESOLVE(var, symname)  do { \
     if (!(var)) { \
-        dlerror(); \
         (var) = (typeof(var)) dlsym(RTLD_NEXT, symname); \
-        const char *e = dlerror(); \
-        RIO_LOG("dlsym(" symname ") -> %p  err=%s", (void*)(var), e ? e : "(none)"); \
     } \
 } while (0)
 
+/*
+ * constructor 里 resolve 所有函数指针 —— 一次搞定，劫持函数里直接用。
+ * 之前 constructor 里留空导致 FILE* 层 real_* 指针为 NULL，fread/fseek 返回 0。
+ */
 __attribute__((constructor(65534)))
 static void rio_init(void) {
     RESOLVE(real_open, "open");          RESOLVE(real_openat, "openat");
@@ -122,8 +123,8 @@ static void rio_init(void) {
     RESOLVE(real_close, "close");        RESOLVE(real_lseek, "lseek");
     RESOLVE(real_pread, "pread");        RESOLVE(real_pwrite, "pwrite");
 
-    RESOLVE(real_fstat, "fstat");                    RESOLVE(real_newfstatat, "newfstatat");
-    RESOLVE(real_stat, "stat");                      RESOLVE(real_lstat, "lstat");
+    RESOLVE(real_fstat, "fstat");                 RESOLVE(real_newfstatat, "newfstatat");
+    RESOLVE(real_stat, "stat");                   RESOLVE(real_lstat, "lstat");
 
     RESOLVE(real_fopen, "fopen");        RESOLVE(real_fopen64, "fopen64");
     RESOLVE(real_freopen, "freopen");    RESOLVE(real_fdopen, "fdopen");
@@ -136,7 +137,7 @@ static void rio_init(void) {
 }
 
 /* ================================================================
- *  open 家族 —— 只查 pack_lookup，命中则走 pack，否则透传
+ *  open 家族
  * ================================================================ */
 
 static mode_t extract_mode(int flags, va_list *ap) {
@@ -148,24 +149,30 @@ static mode_t extract_mode(int flags, va_list *ap) {
 }
 
 /*
- * pack 模式的 open 共享辅助：
- *   查 rio_pack_lookup(path) → 打开 pack_file → rio_map_alloc(rh, offset, size)
- * 成功返回 fake fd；path 未注册或打开失败返回 -1。
+ * shm 模式 open：
+ *   1) rio_pack_lookup(path) —— 首次调用触发 autoload（连接服务端 + mmap 16MB shm）
+ *   2) rio_pack_shm_base()/size 拿本地 mmap 基址
+ *   3) rio_map_alloc() 分配假 fd，slot 里存 shm_base + virtual_off/sz + local_pos
+ *   零 TCP、零远程 open —— 所有后续 I/O 都是本地 memcpy。
  */
 static int rio_open_pack_path(const char *path, int flags, mode_t mode) {
+    (void)flags; (void)mode;
+
     const rio_pack_entry_t *pent = rio_pack_lookup(path);
     if (!pent) return -1;
 
-    rio_connect();
-    remote_handle_t rh = 0;
-    if (rio_do_open(rio_pack_pack_file(), flags, mode, &rh) < 0) {
+    uint8_t *base = rio_pack_shm_base();
+    size_t   sz   = rio_pack_shm_size();
+    if (!base) {
+        RIO_LOG("open(pack): shm_base is NULL — autoload 失败？");
         errno = EIO; return -1;
     }
-    int fake = rio_map_alloc(rh, pent->offset, pent->size);
-    if (fake < 0) { rio_do_close(rh); errno = EMFILE; return -1; }
-    RIO_LOG("open(pack) %s -> %s rh=%u off=%lu sz=%lu -> fakefd=%d",
-            path, rio_pack_pack_file(), rh,
-            (unsigned long)pent->offset, (unsigned long)pent->size, fake);
+
+    int fake = rio_map_alloc(base, sz, pent->offset, pent->size);
+    if (fake < 0) { errno = EMFILE; return -1; }
+
+    RIO_LOG("open(pack) %s -> shm+%lu sz=%lu -> fakefd=%d",
+            path, (unsigned long)pent->offset, (unsigned long)pent->size, fake);
     return fake;
 }
 
@@ -243,69 +250,69 @@ int __open_nocancel(const char *pathname, int flags, ...) {
 }
 
 /* ================================================================
- *  read / write / close / lseek —— 所有远程 fd 都是 pack 模式
- *  每次 read/write 前 lseek(pack_rh, pack_offset + pack_pos)
- *  lseek 只更新客户端 track 的 pack_pos
+ *  read / write / close / lseek —— 假 fd 全是本地 memcpy
  * ================================================================ */
 
-static size_t clamp_pack_count(const rio_slot_t *s, size_t count) {
-    if (!s || s->pack_size == 0) return count;
-    uint64_t remain = (s->pack_pos < s->pack_size) ? (s->pack_size - s->pack_pos) : 0;
+/* clamp count 到 [local_pos, virtual_sz] 范围内，返回要读写的实际字节数 */
+static size_t clamp_virtual_count(const rio_slot_t *s, uint64_t pos, size_t count) {
+    if (!s) return count;
+    if (s->virtual_sz == 0) return count;  /* 0 = 不限 */
+    if (pos >= s->virtual_sz) return 0;
+    uint64_t remain = s->virtual_sz - pos;
     return (count > remain) ? (size_t)remain : count;
 }
 
 ssize_t read(int fd, void *buf, size_t count) {
     if (!rio_map_is_remote(fd)) return real_read ? real_read(fd, buf, count) : -1;
 
-    rio_connect();
-    remote_handle_t rh = rio_map_to_handle(fd);
     const rio_slot_t *s = rio_map_slot(fd);
+    if (!s || !s->shm_base) { errno = EBADF; return -1; }
 
-    count = clamp_pack_count(s, count);
-    if (count == 0) return 0;
-    rio_do_lseek(rh, (off_t)(s->pack_offset + s->pack_pos), SEEK_SET);
-    ssize_t n = rio_do_read(rh, buf, count);
-    if (n > 0) rio_map_set_pos(fd, s->pack_pos + (uint64_t)n);
-    return n;
+    uint64_t pos = s->local_pos;
+    size_t   n   = clamp_virtual_count(s, pos, count);
+    if (n == 0) return 0;
+
+    memcpy(buf, s->shm_base + s->virtual_off + pos, n);
+    rio_map_set_pos(fd, pos + (uint64_t)n);
+    return (ssize_t)n;
 }
 
 ssize_t write(int fd, const void *buf, size_t count) {
     if (!rio_map_is_remote(fd)) return real_write ? real_write(fd, buf, count) : -1;
 
-    rio_connect();
-    remote_handle_t rh = rio_map_to_handle(fd);
     const rio_slot_t *s = rio_map_slot(fd);
+    if (!s || !s->shm_base) { errno = EBADF; return -1; }
 
-    count = clamp_pack_count(s, count);
-    if (count == 0) { errno = ENOSPC; return -1; }
-    rio_do_lseek(rh, (off_t)(s->pack_offset + s->pack_pos), SEEK_SET);
-    ssize_t n = rio_do_write(rh, buf, count);
-    if (n > 0) rio_map_set_pos(fd, s->pack_pos + (uint64_t)n);
-    return n;
+    uint64_t pos = s->local_pos;
+    size_t   n   = clamp_virtual_count(s, pos, count);
+    if (n == 0) { errno = ENOSPC; return -1; }
+
+    memcpy(s->shm_base + s->virtual_off + pos, buf, n);
+    rio_map_set_pos(fd, pos + (uint64_t)n);
+    return (ssize_t)n;
 }
 
 int close(int fd) {
     if (!rio_map_is_remote(fd)) return real_close ? real_close(fd) : -1;
-
-    rio_connect();
-    remote_handle_t rh = rio_map_to_handle(fd);
-    int rc = rio_do_close(rh);
     rio_map_free(fd);
-    return rc;
+    return 0;
 }
 
 off_t lseek(int fd, off_t offset, int whence) {
     if (!rio_map_is_remote(fd)) return real_lseek ? real_lseek(fd, offset, whence) : (off_t)-1;
 
     const rio_slot_t *s = rio_map_slot(fd);
+    if (!s) { errno = EBADF; return (off_t)-1; }
+
     uint64_t new_pos;
     switch (whence) {
         case SEEK_SET: new_pos = (offset < 0) ? 0 : (uint64_t)offset; break;
-        case SEEK_CUR: new_pos = s->pack_pos + (uint64_t)offset; break;
+        case SEEK_CUR: new_pos = s->local_pos + (uint64_t)offset; break;
         case SEEK_END:
-            if (s->pack_size == 0) { errno = EINVAL; return (off_t)-1; }
-            new_pos = s->pack_size + (uint64_t)offset;
-            if (offset < 0 && new_pos > s->pack_size) new_pos = 0;
+            if (s->virtual_sz == 0) { errno = EINVAL; return (off_t)-1; }
+            new_pos = s->virtual_sz + (int64_t)offset;
+            if ((int64_t)new_pos < 0) new_pos = 0;
+            if (new_pos > s->virtual_sz) new_pos = s->virtual_sz;
             break;
         default: errno = EINVAL; return (off_t)-1;
     }
@@ -316,44 +323,50 @@ off_t lseek(int fd, off_t offset, int whence) {
 ssize_t pread(int fd, void *buf, size_t count, off_t offset) {
     if (!rio_map_is_remote(fd)) return real_pread ? real_pread(fd, buf, count, offset) : -1;
 
-    rio_connect();
-    remote_handle_t rh = rio_map_to_handle(fd);
     const rio_slot_t *s = rio_map_slot(fd);
+    if (!s || !s->shm_base) { errno = EBADF; return -1; }
 
-    if ((uint64_t)offset + count > s->pack_size && s->pack_size > 0)
-        count = (size_t)(s->pack_size - (uint64_t)offset);
-    if (count == 0) return 0;
-    rio_do_lseek(rh, (off_t)(s->pack_offset + (uint64_t)offset), SEEK_SET);
-    return rio_do_read(rh, buf, count);
+    if (offset < 0) { errno = EINVAL; return -1; }
+    uint64_t pos = (uint64_t)offset;
+    size_t   n   = clamp_virtual_count(s, pos, count);
+    if (n == 0) return 0;
+
+    memcpy(buf, s->shm_base + s->virtual_off + pos, n);
+    /* pread 不更新 local_pos */
+    return (ssize_t)n;
 }
 
 ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
     if (!rio_map_is_remote(fd)) return real_pwrite ? real_pwrite(fd, buf, count, offset) : -1;
 
-    rio_connect();
-    remote_handle_t rh = rio_map_to_handle(fd);
     const rio_slot_t *s = rio_map_slot(fd);
+    if (!s || !s->shm_base) { errno = EBADF; return -1; }
 
-    if ((uint64_t)offset + count > s->pack_size && s->pack_size > 0)
-        count = (size_t)(s->pack_size - (uint64_t)offset);
-    if (count == 0) { errno = ENOSPC; return -1; }
-    rio_do_lseek(rh, (off_t)(s->pack_offset + (uint64_t)offset), SEEK_SET);
-    return rio_do_write(rh, buf, count);
+    if (offset < 0) { errno = EINVAL; return -1; }
+    uint64_t pos = (uint64_t)offset;
+    size_t   n   = clamp_virtual_count(s, pos, count);
+    if (n == 0) { errno = ENOSPC; return -1; }
+
+    memcpy(s->shm_base + s->virtual_off + pos, buf, n);
+    /* pwrite 不更新 local_pos */
+    return (ssize_t)n;
 }
 
+/* lseek64 / pread64 / pwrite64 在 glibc 里通常就是别名，通常不需要单独劫持 */
+
 /* ================================================================
- *  stat 家族 —— 对假 fd 返回合理的 regular file stat
+ *  stat 家族
  * ================================================================ */
 
 static void fill_remote_stat(struct stat *st, uint64_t sz) {
     memset(st, 0, sizeof(*st));
-    st->st_mode = S_IFREG | 0644;
-    st->st_size = (off_t)sz;
-    st->st_nlink = 1;
-    st->st_blocks = 0;
+    st->st_mode    = S_IFREG | 0644;
+    st->st_size    = (off_t)sz;
+    st->st_nlink   = 1;
+    st->st_blocks  = 0;
     st->st_blksize = 4096;
-    st->st_uid = getuid();
-    st->st_gid = getgid();
+    st->st_uid     = getuid();
+    st->st_gid     = getgid();
 }
 
 int fstat(int fd, struct stat *buf) {
@@ -361,7 +374,7 @@ int fstat(int fd, struct stat *buf) {
     if (rio_map_is_remote(fd)) {
         if (!buf) { errno = EFAULT; return -1; }
         const rio_slot_t *s = rio_map_slot(fd);
-        fill_remote_stat(buf, s ? s->pack_size : 0);
+        fill_remote_stat(buf, s ? s->virtual_sz : 0);
         return 0;
     }
     return real_fstat ? real_fstat(fd, buf) : -1;
@@ -400,7 +413,7 @@ int lstat(const char *path, struct stat *buf) {
 }
 
 /* ================================================================
- *  FILE* 层 —— fopen 用 fopencookie 创建，绕开假 fd 验证
+ *  FILE* 层 —— fopencookie 创建，回调全是 memcpy
  * ================================================================ */
 
 #define RIO_FP_REMOTE_FLAG   (1u << 29)
@@ -431,67 +444,68 @@ static int parse_mode(const char *mode, mode_t *out_mode) {
     return flags;
 }
 
-/* ---------- fopencookie cookie ---------- */
+/* ---------- fopencookie cookie（shm 模式） ---------- */
 typedef struct {
-    remote_handle_t rh;
-    uint64_t        pack_offset;
-    uint64_t        pack_size;
-    uint64_t        pack_pos;
+    uint8_t  *shm_base;
+    size_t    shm_size;
+    uint64_t  virtual_off;
+    uint64_t  virtual_sz;
+    uint64_t  local_pos;
 } rio_cookie_t;
 
 static ssize_t rio_cookie_read(void *c, char *buf, size_t size) {
     rio_cookie_t *ck = (rio_cookie_t *)c;
-    rio_connect();
-    size_t count = size;
-    if (ck->pack_size > 0 && ck->pack_pos >= ck->pack_size) return 0;
-    if (ck->pack_size > 0) {
-        uint64_t remain = ck->pack_size - ck->pack_pos;
-        if (count > remain) count = (size_t)remain;
+    size_t n = clamp_virtual_count((const rio_slot_t *)NULL, ck->local_pos, size);
+    /* clamp_virtual_count 里 s==NULL 返回 count，我们在这里自己 clamp */
+    if (ck->virtual_sz > 0 && ck->local_pos >= ck->virtual_sz) return 0;
+    if (ck->virtual_sz > 0) {
+        uint64_t remain = ck->virtual_sz - ck->local_pos;
+        if (n > remain) n = (size_t)remain;
     }
-    rio_do_lseek(ck->rh, (off_t)(ck->pack_offset + ck->pack_pos), SEEK_SET);
-    ssize_t n = rio_do_read(ck->rh, buf, count);
-    if (n > 0) ck->pack_pos += (uint64_t)n;
-    return n;
+    if (n == 0) return 0;
+    memcpy(buf, ck->shm_base + ck->virtual_off + ck->local_pos, n);
+    ck->local_pos += (uint64_t)n;
+    return (ssize_t)n;
 }
+
 static ssize_t rio_cookie_write(void *c, const char *buf, size_t size) {
     rio_cookie_t *ck = (rio_cookie_t *)c;
-    rio_connect();
-    size_t count = size;
-    if (ck->pack_size > 0 && ck->pack_pos >= ck->pack_size) { errno = ENOSPC; return -1; }
-    if (ck->pack_size > 0) {
-        uint64_t remain = ck->pack_size - ck->pack_pos;
-        if (count > remain) count = (size_t)remain;
+    if (ck->virtual_sz > 0 && ck->local_pos >= ck->virtual_sz) { errno = ENOSPC; return -1; }
+    size_t n = size;
+    if (ck->virtual_sz > 0) {
+        uint64_t remain = ck->virtual_sz - ck->local_pos;
+        if (n > remain) n = (size_t)remain;
     }
-    rio_do_lseek(ck->rh, (off_t)(ck->pack_offset + ck->pack_pos), SEEK_SET);
-    ssize_t n = rio_do_write(ck->rh, buf, count);
-    if (n > 0) ck->pack_pos += (uint64_t)n;
-    return n;
+    if (n == 0) { errno = ENOSPC; return -1; }
+    memcpy(ck->shm_base + ck->virtual_off + ck->local_pos, buf, n);
+    ck->local_pos += (uint64_t)n;
+    return (ssize_t)n;
 }
+
 static int rio_cookie_seek(void *c, off64_t *offset, int whence) {
     rio_cookie_t *ck = (rio_cookie_t *)c;
     uint64_t new_pos;
     off_t off = (off_t)*offset;
     switch (whence) {
         case SEEK_SET: new_pos = (off < 0) ? 0 : (uint64_t)off; break;
-        case SEEK_CUR: new_pos = ck->pack_pos + (uint64_t)off; break;
+        case SEEK_CUR: new_pos = ck->local_pos + (uint64_t)off; break;
         case SEEK_END:
-            if (ck->pack_size == 0) return -1;
-            new_pos = (int64_t)ck->pack_size + off;
-            if (new_pos > ck->pack_size) new_pos = ck->pack_size;
+            if (ck->virtual_sz == 0) return -1;
+            new_pos = (int64_t)ck->virtual_sz + off;
+            if (new_pos > ck->virtual_sz) new_pos = ck->virtual_sz;
             if ((int64_t)new_pos < 0) new_pos = 0;
             break;
         default: return -1;
     }
-    ck->pack_pos = new_pos;
+    ck->local_pos = new_pos;
     *offset = (off64_t)new_pos;
     return 0;
 }
+
 static int rio_cookie_close(void *c) {
     rio_cookie_t *ck = (rio_cookie_t *)c;
-    rio_connect();
-    int rc = rio_do_close(ck->rh);
     free(ck);
-    return rc;
+    return 0;
 }
 
 static FILE *rio_fopen_impl(const char *path, const char *mode) {
@@ -499,21 +513,20 @@ static FILE *rio_fopen_impl(const char *path, const char *mode) {
     int flags = parse_mode(mode, &m);
     if (flags < 0) { errno = EINVAL; return NULL; }
 
-    rio_connect();
-    remote_handle_t rh = 0;
     const rio_pack_entry_t *pent = rio_pack_lookup(path);
     if (!pent) { errno = ENOENT; return NULL; }
 
-    if (rio_do_openat(AT_FDCWD, rio_pack_pack_file(), flags, m, &rh) < 0) {
-        errno = EIO; return NULL;
-    }
+    uint8_t *base = rio_pack_shm_base();
+    size_t   sz   = rio_pack_shm_size();
+    if (!base) { errno = EIO; return NULL; }
 
     rio_cookie_t *ck = (rio_cookie_t *)calloc(1, sizeof(*ck));
-    if (!ck) { rio_do_close(rh); errno = ENOMEM; return NULL; }
-    ck->rh          = rh;
-    ck->pack_offset = pent->offset;
-    ck->pack_size   = pent->size;
-    ck->pack_pos    = 0;
+    if (!ck) { errno = ENOMEM; return NULL; }
+    ck->shm_base    = base;
+    ck->shm_size    = sz;
+    ck->virtual_off = pent->offset;
+    ck->virtual_sz  = pent->size;
+    ck->local_pos   = 0;
 
     cookie_io_functions_t funcs = {
         .read  = rio_cookie_read,
@@ -522,7 +535,7 @@ static FILE *rio_fopen_impl(const char *path, const char *mode) {
         .close = rio_cookie_close,
     };
     FILE *fp = fopencookie(ck, mode, funcs);
-    if (!fp) { rio_do_close(rh); free(ck); errno = EINVAL; return NULL; }
+    if (!fp) { free(ck); errno = EINVAL; return NULL; }
     fp->_flags |= RIO_FP_REMOTE_FLAG;
     return fp;
 }
@@ -546,20 +559,13 @@ FILE *fopen64(const char *path, const char *mode) {
 }
 
 FILE *freopen(const char *path, const char *mode, FILE *stream) {
-    if (rio_map_is_remote(real_fileno ? real_fileno(stream) : fileno(stream))) {
-        rio_connect();
-        rio_do_close(rio_map_to_handle(real_fileno ? real_fileno(stream) : fileno(stream)));
-        rio_map_free(real_fileno ? real_fileno(stream) : fileno(stream));
-        stream->_flags &= ~RIO_FP_REMOTE_FLAG;
-    }
+    /* shm 模式下不支持对假 fd 做 freopen —— 走真实 freopen */
     FILE *fp = real_freopen ? real_freopen(path, mode, stream) : NULL;
-    if (!fp) return NULL;
-    int fd = real_fileno ? real_fileno(fp) : fileno(fp);
-    if (rio_map_is_remote(fd)) fp->_flags |= RIO_FP_REMOTE_FLAG;
     return fp;
 }
 
 FILE *fdopen(int fd, const char *mode) {
+    /* 对假 fd，glibc 真实 fdopen 会 EBADF —— 让它走真实 fdopen */
     FILE *fp = real_fdopen ? real_fdopen(fd, mode) : NULL;
     if (!fp) return NULL;
     if (rio_map_is_remote(fd)) fp->_flags |= RIO_FP_REMOTE_FLAG;
@@ -579,46 +585,18 @@ size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
 }
 
 int fclose(FILE *fp) {
-    if (is_remote_fp(fp)) {
-        real_fflush ? real_fflush(fp) : fflush(fp);
-        int fd = real_fileno ? real_fileno(fp) : fileno(fp);
-        rio_connect();
-        rio_do_close(rio_map_to_handle(fd));
-        rio_map_free(fd);
-    }
     return real_fclose ? real_fclose(fp) : EOF;
 }
 
 int fseek(FILE *stream, long offset, int whence) {
-    if (is_remote_fp(stream)) {
-        int fd = real_fileno ? real_fileno(stream) : fileno(stream);
-        rio_connect();
-        if (real_fflush) real_fflush(stream);
-        /* pack 模式下 lseek 只更新客户端 pack_pos */
-        off_t r = lseek(fd, offset, whence);
-        return (r == (off_t)-1) ? -1 : 0;
-    }
     return real_fseek ? real_fseek(stream, offset, whence) : -1;
 }
 
 long ftell(FILE *stream) {
-    if (is_remote_fp(stream)) {
-        int fd = real_fileno ? real_fileno(stream) : fileno(stream);
-        if (real_fflush) real_fflush(stream);
-        return (long)lseek(fd, 0, SEEK_CUR);
-    }
     return real_ftell ? real_ftell(stream) : -1;
 }
 
 void rewind(FILE *stream) {
-    if (is_remote_fp(stream)) {
-        int fd = real_fileno ? real_fileno(stream) : fileno(stream);
-        rio_connect();
-        if (real_fflush) real_fflush(stream);
-        lseek(fd, 0, SEEK_SET);
-        stream->_flags &= ~(uint32_t)_IO_EOF_SEEN;
-        return;
-    }
     if (real_rewind) real_rewind(stream);
 }
 

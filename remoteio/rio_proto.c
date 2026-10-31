@@ -46,9 +46,13 @@ static ssize_t rio_recv_all(int fd, void *buf, size_t n) {
 }
 
 /* ---------- 连接 ---------- */
-int rio_connect(void) {
-    pthread_mutex_lock(&g_net_lock);
-    if (g_sock >= 0) { pthread_mutex_unlock(&g_net_lock); return 0; }
+
+/*
+ * 内部版本（假设 g_net_lock 已由调用者持有）。
+ * 避免 rio_call() 内调 rio_connect() 时双重 lock 死锁。
+ */
+static int rio_connect_locked(void) {
+    if (g_sock >= 0) return 0;
 
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
@@ -57,7 +61,6 @@ int rio_connect(void) {
 
     if (getaddrinfo(RIO_REMOTE_HOST, portstr, &hints, &res) != 0) {
         RIO_LOG("getaddrinfo failed: %s", gai_strerror(errno));
-        pthread_mutex_unlock(&g_net_lock);
         return -1;
     }
 
@@ -71,7 +74,6 @@ int rio_connect(void) {
         close(s);
     }
     freeaddrinfo(res);
-    pthread_mutex_unlock(&g_net_lock);
 
     if (g_sock < 0) {
         RIO_LOG("connect %s:%d failed: %s", RIO_REMOTE_HOST, RIO_REMOTE_PORT, strerror(errno));
@@ -79,6 +81,13 @@ int rio_connect(void) {
     }
     RIO_LOG("connected to %s:%d", RIO_REMOTE_HOST, RIO_REMOTE_PORT);
     return 0;
+}
+
+int rio_connect(void) {
+    pthread_mutex_lock(&g_net_lock);
+    int rc = rio_connect_locked();
+    pthread_mutex_unlock(&g_net_lock);
+    return rc;
 }
 
 void rio_disconnect(void) {
@@ -95,8 +104,8 @@ static int rio_call(uint32_t opcode, const void *req_body, uint32_t req_len,
                     uint64_t *ret_val_out, uint32_t *resp_body_len) {
     pthread_mutex_lock(&g_net_lock);
 
-    /* 确保连接 */
-    if (g_sock < 0) { rio_connect(); }
+    /* 确保连接 —— 调 locked 版本，避免双重 lock */
+    if (g_sock < 0) { rio_connect_locked(); }
     if (g_sock < 0) { pthread_mutex_unlock(&g_net_lock); return -1; }
 
     /* 发请求 */
@@ -248,4 +257,22 @@ off_t rio_do_lseek(remote_handle_t rh, off_t offset, int whence) {
     return (off_t)(int64_t)rv;
 }
 
-/* 注意：路径判断已移到 rio_pack 模块 —— libremoteio.c 统一用 rio_pack_lookup() */
+/* ---------- shm 模式专用 ---------- */
+
+/*
+ * 请求服务端初始化 shm 段（创建 + ftruncate + 写 pack 头部）。
+ * 客户端拿到响应后自己 shm_open + mmap。
+ */
+int rio_do_shm_open_req(const char *shm_name) {
+    uint32_t plen = (uint32_t)strlen(shm_name) + 1;
+    uint32_t body_len = 4 + plen;
+    uint8_t *body = (uint8_t *)malloc(body_len);
+    if (!body) return -1;
+    uint32_t off = 0;
+    memcpy(body + off, &plen, 4); off += 4;
+    memcpy(body + off, shm_name, plen);
+    uint64_t rv = 0;
+    int rc = rio_call(OP_SHM_OPEN, body, body_len, NULL, 0, &rv, NULL);
+    free(body);
+    return rc < 0 ? -1 : 0;
+}

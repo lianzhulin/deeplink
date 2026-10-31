@@ -1,8 +1,10 @@
 /*
- * rio_fdmap.c — 假 fd 映射表（pack 模式专用）
+ * rio_fdmap.c — 假 fd 映射表（共享内存 pack 模式）
  *
- * 只有一种模式：pack —— 假 fd → pack_file 的远程 handle + 虚拟 offset/size/pos。
- * open(pack_file) 一次，多个虚拟 fd 共享同一个 rh，各自 track 独立 pack_pos。
+ * 假 fd → (mmap 基址 + 虚拟偏移 + 虚拟长度 + 当前位置)
+ *
+ * read/write 直接对 mmap 区域 memcpy，lseek 只更新 local_pos。
+ * 没有远程 handle、没有远程 close —— 所有 fd 关闭只是释放槽位。
  */
 
 #define _GNU_SOURCE
@@ -13,16 +15,18 @@
 static rio_slot_t  g_slots[RIO_MAX_REMOTE_FDS];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
-int rio_map_alloc(remote_handle_t rh, uint64_t offset, uint64_t size) {
+int rio_map_alloc(uint8_t *shm_base, size_t shm_size,
+                  uint64_t virtual_offset, uint64_t virtual_size) {
     pthread_mutex_lock(&g_lock);
     int idx = -1;
     for (int i = 0; i < RIO_MAX_REMOTE_FDS; i++) {
         if (!g_slots[i].used) {
             g_slots[i].used        = 1;
-            g_slots[i].rh          = rh;
-            g_slots[i].pack_offset = offset;
-            g_slots[i].pack_size   = size;
-            g_slots[i].pack_pos    = 0;
+            g_slots[i].shm_base    = shm_base;
+            g_slots[i].shm_size    = shm_size;
+            g_slots[i].virtual_off = virtual_offset;
+            g_slots[i].virtual_sz  = virtual_size;
+            g_slots[i].local_pos   = 0;
             idx = i;
             break;
         }
@@ -38,11 +42,6 @@ int rio_map_is_remote(int fd) {
            g_slots[fd - RIO_FAKE_FD_BASE].used;
 }
 
-remote_handle_t rio_map_to_handle(int fd) {
-    int idx = fd - RIO_FAKE_FD_BASE;
-    return g_slots[idx].rh;
-}
-
 const rio_slot_t *rio_map_slot(int fd) {
     if (!rio_map_is_remote(fd)) return NULL;
     return &g_slots[fd - RIO_FAKE_FD_BASE];
@@ -51,14 +50,13 @@ const rio_slot_t *rio_map_slot(int fd) {
 void rio_map_set_pos(int fd, uint64_t pos) {
     if (!rio_map_is_remote(fd)) return;
     pthread_mutex_lock(&g_lock);
-    int idx = fd - RIO_FAKE_FD_BASE;
-    g_slots[idx].pack_pos = pos;
+    g_slots[fd - RIO_FAKE_FD_BASE].local_pos = pos;
     pthread_mutex_unlock(&g_lock);
 }
 
 uint64_t rio_map_get_pos(int fd) {
     if (!rio_map_is_remote(fd)) return 0;
-    return g_slots[fd - RIO_FAKE_FD_BASE].pack_pos;
+    return g_slots[fd - RIO_FAKE_FD_BASE].local_pos;
 }
 
 void rio_map_free(int fd) {
@@ -66,9 +64,10 @@ void rio_map_free(int fd) {
     pthread_mutex_lock(&g_lock);
     int idx = fd - RIO_FAKE_FD_BASE;
     g_slots[idx].used        = 0;
-    g_slots[idx].rh          = 0;
-    g_slots[idx].pack_offset = 0;
-    g_slots[idx].pack_size   = 0;
-    g_slots[idx].pack_pos    = 0;
+    g_slots[idx].shm_base    = NULL;
+    g_slots[idx].shm_size    = 0;
+    g_slots[idx].virtual_off = 0;
+    g_slots[idx].virtual_sz  = 0;
+    g_slots[idx].local_pos   = 0;
     pthread_mutex_unlock(&g_lock);
 }

@@ -1,21 +1,23 @@
 /*
- * rio_pack.h — pack 多虚拟文件自描述模块
+ * rio_pack.h — pack 多虚拟文件自描述模块（共享内存模式）
  *
- * pack.bin 自描述格式（pack 文件本身包含头部，无需外部 INI 或运行时 register）：
+ * pack 自描述格式（服务端初始化 16MB POSIX 共享内存段，段内包含头部）：
  *
  *   offset 0:   rio_pack_hdr_t (固定 256 字节)
  *   offset 256: rio_pack_entry_t[n_entries] (每项 144 字节)
  *   offset H+E: pack body (各虚拟文件实际内容)
  *
- * 每个 entry 的 offset 是 pack.bin 内的**绝对偏移**（从文件头算起）。
+ * 每个 entry 的 offset 是 shm 内的**绝对偏移**（从 shm 基址算起）。
  *
  * 加载流程（懒加载）：
- *   第一次 rio_pack_lookup() 被调用时 → rio_connect() → rio_do_open(pack_file)
- *   → rio_do_read(hdr) → 校验 magic → rio_do_read(entries[]) → 填充内部表
+ *   第一次 rio_pack_lookup() 被调用时：
+ *     → rio_do_shm_open_req() 让服务端确认 shm
+ *     → 客户端 shm_open(RIO_PACK_SHM_NAME) + mmap
+ *     → 从 shm 头部 memcpy 读 header + entries → 填充内部表
+ *   之后所有虚拟文件 I/O 都是对本地 mmap 的 memcpy —— 零网络。
  *
  * 业务代码集成：
- *   rio_pack_set_pack_file("/remote/pack.bin");  // 可选，覆盖默认路径
- *   // 然后 open("/virtual/config.txt") — 自动从 pack.bin 头部查映射
+ *   业务代码零配置，直接 open("/virtual/config.txt") 即可。
  */
 
 #ifndef RIO_PACK_H
@@ -24,12 +26,7 @@
 #include "remoteio.h"
 #include <stdint.h>
 
-/* 默认 pack 大文件在服务端的路径 —— 可通过 rio_pack_set_pack_file 或编译宏覆盖 */
-#ifndef RIO_PACK_FILE
-#define RIO_PACK_FILE  "/remote/pack.bin"
-#endif
-
-/* pack.bin 文件魔数 + 版本 */
+/* pack 头部魔数 + 版本 */
 #define RIO_PACK_MAGIC     "RIOPACK!"
 #define RIO_PACK_MAGIC_LEN 8
 #define RIO_PACK_VERSION   1
@@ -65,17 +62,21 @@ void rio_pack_clear(void);
 
 /* ---- 查询 API ---- */
 
-/* 查虚拟路径是否已注册（首次调用时自动从 pack.bin 懒加载）*/
+/* 查虚拟路径是否已注册（首次调用时自动从 pack 懒加载）*/
 const rio_pack_entry_t *rio_pack_lookup(const char *vpath);
 
-/* 当前 pack_file 路径 */
+/* shm 模式下 pack 文件路径已无意义（保留空实现，兼容旧代码）*/
 const char *rio_pack_pack_file(void);
 
 /* 是否已注册至少一个段 */
 int rio_pack_is_enabled(void);
 
+/* shm 模式下暴露给 libremoteio.c —— 客户端本地 mmap 基址 */
+uint8_t *rio_pack_shm_base(void);
+size_t   rio_pack_shm_size(void);
+
 /* ---- 内部 ---- */
 void rio_pack_init(void);        /* constructor 调 */
-int  rio_pack_autoload(void);    /* 从 pack.bin 头部加载映射（懒加载入口）*/
+int  rio_pack_autoload(void);    /* 从 shm 头部加载映射（懒加载入口）*/
 
 #endif /* RIO_PACK_H */
