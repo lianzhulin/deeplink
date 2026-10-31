@@ -14,7 +14,7 @@ BUILD    = .
 
 # 劫持库
 RIO_HDR  = remoteio.h
-RIO_OBJS = rio_fdmap.o rio_proto.o libremoteio.o
+RIO_OBJS = rio_fdmap.o rio_proto.o rio_pack.o libremoteio.o
 
 # 可执行文件
 SRV_BIN  = remote_server
@@ -37,7 +37,10 @@ rio_fdmap.o: rio_fdmap.c $(RIO_HDR)
 rio_proto.o: rio_proto.c $(RIO_HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-libremoteio.o: libremoteio.c $(RIO_HDR)
+rio_pack.o: rio_pack.c rio_pack.h $(RIO_HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+libremoteio.o: libremoteio.c $(RIO_HDR) rio_pack.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # --- remote_server ---

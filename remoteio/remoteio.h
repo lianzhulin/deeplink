@@ -72,10 +72,20 @@ typedef struct {
 /* 远程句柄（服务端侧的 fd 编号） */
 typedef uint32_t remote_handle_t;
 
-/* 映射表记录：假 fd → 远程 handle + 连接 */
+/* 映射表记录：假 fd → 远程 handle (+ pack 元数据) */
 typedef struct {
     int              used;      /* 槽位是否被占用 */
     remote_handle_t  rh;        /* 服务端侧 fd */
+
+    /* ---- pack 映射字段 ----
+     * 当该 fake fd 对应"虚拟路径 → pack 大文件一段"的映射时启用。
+     * 此时 rh 是 pack_file 的 handle，
+     * read/write 需要 lseek(rh, pack_offset + pack_pos) 才能定位到虚拟位置。
+     */
+    int              pack;      /* 1 = pack 模式, 0 = 普通远程文件 */
+    uint64_t         pack_offset; /* 在 pack_file 内的起始偏移 */
+    uint64_t         pack_size;   /* 虚拟文件最大长度（0=不限） */
+    uint64_t         pack_pos;    /* 该 fake fd 当前虚拟位置（客户端 track） */
 } rio_slot_t;
 
 /* ---------- 连接管理 ---------- */
@@ -95,9 +105,14 @@ int  rio_do_close(remote_handle_t rh);
 off_t  rio_do_lseek(remote_handle_t rh, off_t offset, int whence);
 
 /* ---------- 映射表操作 ---------- */
-int  rio_map_alloc(remote_handle_t rh);   /* 分配假 fd */
+int  rio_map_alloc(remote_handle_t rh);   /* 分配假 fd（普通远程文件）*/
+int  rio_map_alloc_pack(remote_handle_t rh, uint64_t offset, uint64_t size); /* 分配 pack 模式假 fd */
 int  rio_map_is_remote(int fd);           /* 判断是否远程 fd */
+int  rio_map_is_pack(int fd);              /* 判断是否 pack 模式假 fd */
 remote_handle_t rio_map_to_handle(int fd);/* 假 fd → 远程 handle */
+const rio_slot_t *rio_map_slot(int fd);   /* 假 fd → 完整 slot（只读）*/
+void rio_map_set_pos(int fd, uint64_t pos); /* 更新 pack 模式下虚拟位置 */
+uint64_t rio_map_get_pos(int fd);
 void rio_map_free(int fd);                /* 释放槽位 */
 
 /* ---------- 路径判断 ---------- */
