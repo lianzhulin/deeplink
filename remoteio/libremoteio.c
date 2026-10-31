@@ -1,13 +1,11 @@
 /*
- * libremoteio.c — LD_PRELOAD 劫持主模块（共享内存 pack 模式专用）
+ * libremoteio.c — LD_PRELOAD 劫持主模块（按需拉取 + 版本化）
  *
- * 用户端的 pack 存储是服务端提前初始化好的 16MB POSIX 共享内存段，
- * 客户端第一次 open() 虚拟路径时，rio_pack_autoload() 会：
- *   1) rio_do_shm_open_req() 让服务端确认/初始化 shm
- *   2) 本地 shm_open() + mmap() 拿到 shm_base
- *   3) 从 shm 头部读 header + entries，填充 g_entries[]
- *
- * 之后所有虚拟文件 I/O 都是对本地 mmap 区域 memcpy —— 零网络、零磁盘。
+ * 用户端：
+ *   - 启动只拉 meta（~3KB header + entries + versions[]）
+ *   - 每段 body 按需拉，每次 read 前版本检测（OP_SEG_VERSION → 变了才 OP_SEG_READ）
+ *   - 服务端随时可以修改某段 body — 客户端下次 read 自动发现并重拉
+ *   - write: 本地 shm 写 + dirty=1 —— close 时批量 OP_WRITE_SEG 穿透回服务端
  *
  * 劫持清单：
  *   系统调用层：open, openat, open64, openat64
@@ -111,10 +109,6 @@ static real_fflush_t  real_fflush  = NULL;
     } \
 } while (0)
 
-/*
- * constructor 里 resolve 所有函数指针 —— 一次搞定，劫持函数里直接用。
- * 之前 constructor 里留空导致 FILE* 层 real_* 指针为 NULL，fread/fseek 返回 0。
- */
 __attribute__((constructor(65534)))
 static void rio_init(void) {
     RESOLVE(real_open, "open");          RESOLVE(real_openat, "openat");
@@ -137,7 +131,7 @@ static void rio_init(void) {
 }
 
 /* ================================================================
- *  open 家族
+ *  open 家族 —— 找到 seg_idx，分配 slot
  * ================================================================ */
 
 static mode_t extract_mode(int flags, va_list *ap) {
@@ -148,18 +142,16 @@ static mode_t extract_mode(int flags, va_list *ap) {
     return 0;
 }
 
-/*
- * shm 模式 open：
- *   1) rio_pack_lookup(path) —— 首次调用触发 autoload（连接服务端 + mmap 16MB shm）
- *   2) rio_pack_shm_base()/size 拿本地 mmap 基址
- *   3) rio_map_alloc() 分配假 fd，slot 里存 shm_base + virtual_off/sz + local_pos
- *   零 TCP、零远程 open —— 所有后续 I/O 都是本地 memcpy。
- */
 static int rio_open_pack_path(const char *path, int flags, mode_t mode) {
     (void)flags; (void)mode;
 
     const rio_pack_entry_t *pent = rio_pack_lookup(path);
     if (!pent) return -1;
+
+    /* 找 seg_idx —— rio_pack_lookup 已经在 g_entries 里了，
+     * 我们用 rio_pack_find_seg_idx 也能拿到（内部 linear search）*/
+    int seg_idx = rio_pack_find_seg_idx(path);
+    if (seg_idx < 0) return -1;
 
     uint8_t *base = rio_pack_shm_base();
     size_t   sz   = rio_pack_shm_size();
@@ -168,11 +160,12 @@ static int rio_open_pack_path(const char *path, int flags, mode_t mode) {
         errno = EIO; return -1;
     }
 
-    int fake = rio_map_alloc(base, sz, pent->offset, pent->size);
+    int fake = rio_map_alloc(base, sz, pent->offset, pent->size, (uint32_t)seg_idx);
     if (fake < 0) { errno = EMFILE; return -1; }
 
-    RIO_LOG("open(pack) %s -> shm+%lu sz=%lu -> fakefd=%d",
-            path, (unsigned long)pent->offset, (unsigned long)pent->size, fake);
+    RIO_LOG("open(pack) %s -> shm+%lu sz=%lu seg=%d -> fakefd=%d",
+            path, (unsigned long)pent->offset, (unsigned long)pent->size,
+            seg_idx, fake);
     return fake;
 }
 
@@ -268,6 +261,9 @@ ssize_t read(int fd, void *buf, size_t count) {
     const rio_slot_t *s = rio_map_slot(fd);
     if (!s || !s->shm_base) { errno = EBADF; return -1; }
 
+    /* 确保这段 body 已拉取 + 版本最新 */
+    if (rio_pack_ensure_seg(s->seg_idx) < 0) { errno = EIO; return -1; }
+
     uint64_t pos = s->local_pos;
     size_t   n   = clamp_virtual_count(s, pos, count);
     if (n == 0) return 0;
@@ -283,17 +279,29 @@ ssize_t write(int fd, const void *buf, size_t count) {
     const rio_slot_t *s = rio_map_slot(fd);
     if (!s || !s->shm_base) { errno = EBADF; return -1; }
 
+    /* 确保这段 body 已拉取（可能要覆盖已有数据 —— 但先 ensure 拿到最新版本）*/
+    if (rio_pack_ensure_seg(s->seg_idx) < 0) { errno = EIO; return -1; }
+
     uint64_t pos = s->local_pos;
     size_t   n   = clamp_virtual_count(s, pos, count);
     if (n == 0) { errno = ENOSPC; return -1; }
 
     memcpy(s->shm_base + s->virtual_off + pos, buf, n);
     rio_map_set_pos(fd, pos + (uint64_t)n);
+
+    /* 标记 dirty + 立刻穿透到服务端 —— 保证下次 ensure_seg 拉回来的是最新 */
+    rio_pack_mark_dirty(s->seg_idx);
+    rio_pack_push_seg(s->seg_idx);
+
     return (ssize_t)n;
 }
 
 int close(int fd) {
     if (!rio_map_is_remote(fd)) return real_close ? real_close(fd) : -1;
+
+    /* close 前尝试 flush dirty segs（忽略网络失败 —— 客户端退出前尽力而为）*/
+    rio_pack_flush_dirty_segs();
+
     rio_map_free(fd);
     return 0;
 }
@@ -326,6 +334,8 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset) {
     const rio_slot_t *s = rio_map_slot(fd);
     if (!s || !s->shm_base) { errno = EBADF; return -1; }
 
+    if (rio_pack_ensure_seg(s->seg_idx) < 0) { errno = EIO; return -1; }
+
     if (offset < 0) { errno = EINVAL; return -1; }
     uint64_t pos = (uint64_t)offset;
     size_t   n   = clamp_virtual_count(s, pos, count);
@@ -342,12 +352,16 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
     const rio_slot_t *s = rio_map_slot(fd);
     if (!s || !s->shm_base) { errno = EBADF; return -1; }
 
+    if (rio_pack_ensure_seg(s->seg_idx) < 0) { errno = EIO; return -1; }
+
     if (offset < 0) { errno = EINVAL; return -1; }
     uint64_t pos = (uint64_t)offset;
     size_t   n   = clamp_virtual_count(s, pos, count);
     if (n == 0) { errno = ENOSPC; return -1; }
 
     memcpy(s->shm_base + s->virtual_off + pos, buf, n);
+    rio_pack_mark_dirty(s->seg_idx);
+    rio_pack_push_seg(s->seg_idx);
     /* pwrite 不更新 local_pos */
     return (ssize_t)n;
 }
@@ -444,19 +458,27 @@ static int parse_mode(const char *mode, mode_t *out_mode) {
     return flags;
 }
 
-/* ---------- fopencookie cookie（shm 模式） ---------- */
+/* ---------- fopencookie cookie（按需拉取 + 版本化） ---------- */
 typedef struct {
     uint8_t  *shm_base;
     size_t    shm_size;
     uint64_t  virtual_off;
     uint64_t  virtual_sz;
     uint64_t  local_pos;
+    uint32_t  seg_idx;       /* 对应 pack entry 下标 */
 } rio_cookie_t;
+
+/* 辅助：读前 ensure_seg */
+static int rio_cookie_ensure(rio_cookie_t *ck) {
+    return rio_pack_ensure_seg(ck->seg_idx);
+}
 
 static ssize_t rio_cookie_read(void *c, char *buf, size_t size) {
     rio_cookie_t *ck = (rio_cookie_t *)c;
-    size_t n = clamp_virtual_count((const rio_slot_t *)NULL, ck->local_pos, size);
+    if (rio_cookie_ensure(ck) < 0) return -1;
+
     /* clamp_virtual_count 里 s==NULL 返回 count，我们在这里自己 clamp */
+    size_t n = size;
     if (ck->virtual_sz > 0 && ck->local_pos >= ck->virtual_sz) return 0;
     if (ck->virtual_sz > 0) {
         uint64_t remain = ck->virtual_sz - ck->local_pos;
@@ -470,6 +492,8 @@ static ssize_t rio_cookie_read(void *c, char *buf, size_t size) {
 
 static ssize_t rio_cookie_write(void *c, const char *buf, size_t size) {
     rio_cookie_t *ck = (rio_cookie_t *)c;
+    if (rio_cookie_ensure(ck) < 0) return -1;
+
     if (ck->virtual_sz > 0 && ck->local_pos >= ck->virtual_sz) { errno = ENOSPC; return -1; }
     size_t n = size;
     if (ck->virtual_sz > 0) {
@@ -479,6 +503,8 @@ static ssize_t rio_cookie_write(void *c, const char *buf, size_t size) {
     if (n == 0) { errno = ENOSPC; return -1; }
     memcpy(ck->shm_base + ck->virtual_off + ck->local_pos, buf, n);
     ck->local_pos += (uint64_t)n;
+    rio_pack_mark_dirty(ck->seg_idx);
+    rio_pack_push_seg(ck->seg_idx);
     return (ssize_t)n;
 }
 
@@ -505,6 +531,8 @@ static int rio_cookie_seek(void *c, off64_t *offset, int whence) {
 static int rio_cookie_close(void *c) {
     rio_cookie_t *ck = (rio_cookie_t *)c;
     free(ck);
+    /* fopencookie 路径的 flush 走 real_fflush + real_fclose ——
+     * 但 close 劫持函数会 flush 所有 dirty segs */
     return 0;
 }
 
@@ -520,6 +548,8 @@ static FILE *rio_fopen_impl(const char *path, const char *mode) {
     size_t   sz   = rio_pack_shm_size();
     if (!base) { errno = EIO; return NULL; }
 
+    int seg_idx = rio_pack_find_seg_idx(path);
+
     rio_cookie_t *ck = (rio_cookie_t *)calloc(1, sizeof(*ck));
     if (!ck) { errno = ENOMEM; return NULL; }
     ck->shm_base    = base;
@@ -527,6 +557,7 @@ static FILE *rio_fopen_impl(const char *path, const char *mode) {
     ck->virtual_off = pent->offset;
     ck->virtual_sz  = pent->size;
     ck->local_pos   = 0;
+    ck->seg_idx     = (uint32_t)(seg_idx < 0 ? 0 : seg_idx);
 
     cookie_io_functions_t funcs = {
         .read  = rio_cookie_read,

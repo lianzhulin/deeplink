@@ -75,8 +75,28 @@ int rio_pack_is_enabled(void);
 uint8_t *rio_pack_shm_base(void);
 size_t   rio_pack_shm_size(void);
 
+/* ---- 按需拉取 + 版本化 API ---- */
+
+/* 通过 vpath 找 seg_idx（内部从 g_entries 线性搜索）*/
+int rio_pack_find_seg_idx(const char *vpath);
+
+/* 确保某段 body 已加载到本地 shm
+ * 返回 0 成功，-1 失败
+ * 内部做 OP_SEG_VERSION 检查 + 必要时 OP_SEG_READ 拉 body */
+int rio_pack_ensure_seg(uint32_t seg_idx);
+
+/* 标记某段 dirty（write 本地 shm 之后调用）*/
+void rio_pack_mark_dirty(uint32_t seg_idx);
+
+/* 把指定 seg 完整穿透到服务端 —— write/pwrite 后立刻调用保证实时可见 */
+int rio_pack_push_seg(uint32_t seg_idx);
+
+/* 把所有 dirty 段穿透写回服务端（close/flush 时调用 — 兜底）
+ * 返回成功写回的段数（≥0），-1 表示网络故障（部分可能没写完）*/
+int rio_pack_flush_dirty_segs(void);
+
 /* ---- 内部 ---- */
 void rio_pack_init(void);        /* constructor 调 */
-int  rio_pack_autoload(void);    /* 从 shm 头部加载映射（懒加载入口）*/
+int  rio_pack_autoload(void);    /* 懒加载入口：拉 meta + 本地 shm_create + mmap */
 
 #endif /* RIO_PACK_H */

@@ -1,13 +1,16 @@
 /*
- * rio_pack.c — pack 自描述模块（共享内存模式）
+ * rio_pack.c — pack 自描述模块（按需拉取 + 版本化）
  *
- * 服务端启动时创建 16MB shm 段 (RIO_PACK_SHM_NAME)，头部写入 rio_pack_hdr_t + entries[]。
- * 客户端首次 open() 虚拟路径时：
- *   1) rio_do_shm_open_req() 让服务端确认/初始化 shm
- *   2) 本地 shm_open() + mmap() 拿到 shm_base
- *   3) 从 shm_base 读 header + entries，填充 g_entries[]
+ * 核心设计：
+ *   1) autoload 只拉 meta（~3KB header + entries + versions[]）
+ *   2) 每段 body 按需拉（第一次读某段才拉，之后版本检测）
+ *   3) 写穿透：本地 dirty + close/flush 时 OP_WRITE_SEG 写回服务端
+ *   4) 服务端维护每段 version，客户端每次 read 前检查
  *
- * 之后所有虚拟文件 I/O 都是本地内存 memcpy —— 零网络、零磁盘。
+ * 网络开销极小：
+ *   - 首次: ~3KB meta
+ *   - 每段 read: OP_SEG_VERSION (8B ret_val) + OP_SEG_READ (seg_size) if version changed
+ *   - write: 本地 memcpy，close/flush 才穿透
  */
 
 #define _GNU_SOURCE
@@ -27,13 +30,18 @@
 #define RIO_PACK_INITIAL_CAP  16
 
 static rio_pack_entry_t  *g_entries   = NULL;
-static int                g_count     = 0;
+static int                g_count     = 0;   /* == n_entries from pack header */
 static int                g_cap       = 0;
 static int                g_loaded    = 0;
 
-/* 客户端本地 mmap 基址和大小（autoload 后导出）*/
+/* 客户端本地 mmap 基址和大小 */
 static uint8_t           *g_shm_base  = NULL;
 static size_t             g_shm_size  = 0;
+
+/* 每段状态数组 —— 长度 = g_count */
+static uint8_t          *g_seg_loaded = NULL;   /* 0/1 是否已拉取 body 到本地 shm */
+static uint8_t          *g_seg_dirty  = NULL;   /* 0/1 本地是否有未穿透的修改 */
+static uint32_t         *g_seg_versions = NULL; /* 客户端上次看到的服务端 version */
 
 static int ensure_cap(int need) {
     if (g_cap >= need) return 0;
@@ -46,6 +54,21 @@ static int ensure_cap(int need) {
     return 0;
 }
 
+static int alloc_seg_state(int n) {
+    if (g_seg_loaded) free(g_seg_loaded);
+    if (g_seg_dirty)  free(g_seg_dirty);
+    if (g_seg_versions) free(g_seg_versions);
+    g_seg_loaded = (uint8_t *)calloc((size_t)n, 1);
+    g_seg_dirty  = (uint8_t *)calloc((size_t)n, 1);
+    g_seg_versions = (uint32_t *)calloc((size_t)n, sizeof(uint32_t));
+    if (!g_seg_loaded || !g_seg_dirty || !g_seg_versions) {
+        free(g_seg_loaded); free(g_seg_dirty); free(g_seg_versions);
+        g_seg_loaded = g_seg_dirty = NULL; g_seg_versions = NULL;
+        return -1;
+    }
+    return 0;
+}
+
 /* ---- 对外 API ---- */
 
 void rio_pack_clear(void) {
@@ -53,116 +76,128 @@ void rio_pack_clear(void) {
     g_entries = NULL;
     g_count = 0;
     g_cap = 0;
+    free(g_seg_loaded);    g_seg_loaded = NULL;
+    free(g_seg_dirty);     g_seg_dirty = NULL;
+    free(g_seg_versions);  g_seg_versions = NULL;
 }
 
 int rio_pack_is_enabled(void) {
     return g_count > 0;
 }
 
-/* 返回客户端本地 shm mmap 基址 —— libremoteio.c 的 rio_map_alloc 需要 */
 uint8_t *rio_pack_shm_base(void) { return g_shm_base; }
 size_t   rio_pack_shm_size(void) { return g_shm_size; }
 
-/* ---- 懒加载 ----
- *
- * 跨机器全量同步流程：
- *   1) 发 OP_SHM_OPEN 给远程服务端 → 拿到服务端的 16MB 全量 pack 数据（malloc buffer）
- *   2) 客户端本地 shm_open(O_RDWR|O_CREAT|O_TRUNC) + ftruncate(16MB) + mmap
- *   3) memcpy(下载的 pack 数据, 本地 shm base, 16MB)
- *   4) 从本地 mmap 读 header → 校验 magic/version
- *   5) 从本地 mmap 读 entries → 填充 g_entries[]
- *
- * 核心优势：一次网络传输（16MB），之后所有虚拟文件 I/O 都是本地 memcpy —— 零网络零磁盘。
- */
+/* ---- 懒加载（只拉 meta，不拉 body）---- */
 int rio_pack_autoload(void) {
     if (g_loaded) return g_count;
     g_loaded = 1;
 
-    RIO_LOG("rio_pack_autoload: 向 %s:%d 全量下载 pack 数据...",
-            RIO_REMOTE_HOST, RIO_REMOTE_PORT);
-    uint8_t *pack_data = NULL;
-    uint32_t pack_size = 0;
-    if (rio_do_shm_open_req(RIO_PACK_SHM_NAME, &pack_data, &pack_size) < 0 || !pack_data) {
-        RIO_LOG("rio_pack_autoload: 从服务端下载 pack 数据失败");
+    RIO_LOG("rio_pack_autoload: OP_PACK_META 拉 meta...");
+
+    /* 先拉 meta：[4B n][hdr][entries][4B*n versions] */
+    /* 先分配足够大的 buffer（header=256, entry=144, 假设最多1024段）*/
+    uint32_t meta_cap = 4 + sizeof(rio_pack_hdr_t) +
+                        1024 * (uint32_t)(sizeof(rio_pack_entry_t) + sizeof(uint32_t));
+    uint8_t *meta_buf = (uint8_t *)malloc(meta_cap);
+    if (!meta_buf) { RIO_LOG("meta malloc fail"); return -1; }
+
+    uint32_t meta_len = 0;
+    if (rio_do_pack_meta(meta_buf, meta_cap, &meta_len) < 0) {
+        RIO_LOG("rio_do_pack_meta 失败");
+        free(meta_buf);
         return -1;
     }
-    RIO_LOG("rio_pack_autoload: 下载 %u bytes 完成", pack_size);
 
-    /* 客户端本地创建同名 shm（注意：和远程机器上的 shm 是完全独立的 —— 跨机器 POSIX shm 不互通）*/
+    /* 解析 meta */
+    uint32_t off = 0;
+    uint32_t n = 0;
+    memcpy(&n, meta_buf + off, 4); off += 4;
+    if (n == 0 || n > 1024) {
+        RIO_LOG("meta: n_entries=%u 不合理", n);
+        free(meta_buf); return -1;
+    }
+
+    /* 校验 header */
+    const rio_pack_hdr_t *hdr = (const rio_pack_hdr_t *)(meta_buf + off);
+    off += sizeof(rio_pack_hdr_t);
+    if (memcmp(hdr->magic, RIO_PACK_MAGIC, RIO_PACK_MAGIC_LEN) != 0) {
+        RIO_LOG("meta: bad magic '%.8s'", hdr->magic);
+        free(meta_buf); return -1;
+    }
+    if (hdr->version != RIO_PACK_VERSION) {
+        RIO_LOG("meta: version mismatch %u vs %u", hdr->version, RIO_PACK_VERSION);
+        free(meta_buf); return -1;
+    }
+    if (hdr->n_entries != n) {
+        RIO_LOG("meta: n mismatch (header=%u, meta=%u)", hdr->n_entries, n);
+        free(meta_buf); return -1;
+    }
+
+    /* 拷贝 entries */
+    rio_pack_clear();
+    if (ensure_cap((int)n) < 0) { free(meta_buf); return -1; }
+    memcpy(g_entries, meta_buf + off, sizeof(rio_pack_entry_t) * n);
+    off += sizeof(rio_pack_entry_t) * n;
+    g_count = (int)n;
+
+    /* 拷贝初始 versions */
+    if (alloc_seg_state((int)n) < 0) { free(meta_buf); rio_pack_clear(); return -1; }
+    memcpy(g_seg_versions, meta_buf + off, sizeof(uint32_t) * n);
+    off += sizeof(uint32_t) * n;
+
+    RIO_LOG("rio_pack_autoload: meta 解析完成, n_segs=%u", n);
+    for (uint32_t i = 0; i < n; i++) {
+        RIO_LOG("  [%u] %-28s off=%lu  sz=%lu  v=%u",
+                i, g_entries[i].vpath,
+                (unsigned long)g_entries[i].offset,
+                (unsigned long)g_entries[i].size,
+                g_seg_versions[i]);
+    }
+
+    /* 先把 hdr 存本地（hdr 指向 meta_buf，后面要 free meta_buf）*/
+    rio_pack_hdr_t hdr_copy;
+    memcpy(&hdr_copy, hdr, sizeof(rio_pack_hdr_t));
+    free(meta_buf);
+
+    /* 客户端本地创建 16MB shm —— 只填 header + entries（body 区域先空着）*/
     int fd = shm_open(RIO_PACK_SHM_NAME, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         RIO_LOG("rio_pack_autoload: shm_open(%s) failed: %s",
                 RIO_PACK_SHM_NAME, strerror(errno));
-        free(pack_data);
         return -1;
     }
-    if (ftruncate(fd, (off_t)pack_size) < 0) {
+    if (ftruncate(fd, RIO_PACK_SHM_SIZE) < 0) {
         RIO_LOG("rio_pack_autoload: ftruncate failed: %s", strerror(errno));
-        close(fd);
-        free(pack_data);
-        return -1;
+        close(fd); return -1;
     }
 
-    uint8_t *base = (uint8_t *)mmap(NULL, pack_size,
+    uint8_t *base = (uint8_t *)mmap(NULL, RIO_PACK_SHM_SIZE,
                                      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (base == MAP_FAILED) {
         RIO_LOG("rio_pack_autoload: mmap failed: %s", strerror(errno));
-        free(pack_data);
         return -1;
     }
-
-    /* 把从服务端下载的 pack 数据写入本地 shm —— 之后所有 I/O 都对这块本地 mmap */
-    memcpy(base, pack_data, pack_size);
-    free(pack_data);
 
     g_shm_base = base;
-    g_shm_size = pack_size;
-    RIO_LOG("rio_pack_autoload: 本地 shm mmap %s at %p size=%u  (数据已从远程同步)",
-            RIO_PACK_SHM_NAME, (void *)base, pack_size);
+    g_shm_size = RIO_PACK_SHM_SIZE;
 
-    /* 从 shm 基址读 header */
-    const rio_pack_hdr_t *hdr = (const rio_pack_hdr_t *)base;
-    if (memcmp(hdr->magic, RIO_PACK_MAGIC, RIO_PACK_MAGIC_LEN) != 0) {
-        RIO_LOG("rio_pack_autoload: bad magic (expected '%s', got '%.8s')",
-                RIO_PACK_MAGIC, hdr->magic);
-        return -1;
-    }
-    if (hdr->version != RIO_PACK_VERSION) {
-        RIO_LOG("rio_pack_autoload: version mismatch (got %u, want %u)",
-                hdr->version, RIO_PACK_VERSION);
-        return -1;
-    }
-    if (hdr->n_entries == 0 || hdr->n_entries > 1024) {
-        RIO_LOG("rio_pack_autoload: n_entries=%u looks wrong", hdr->n_entries);
-        return -1;
-    }
-    RIO_LOG("rio_pack_autoload: magic=%.8s version=%u n_entries=%u",
-            hdr->magic, hdr->version, hdr->n_entries);
+    /* 清零 + 把 header + entries 写入本地 shm（body 区域保持 0 —— 每次 ensure_seg 从服务端拉）*/
+    memset(base, 0, RIO_PACK_SHM_SIZE);
+    memcpy(base, &hdr_copy, sizeof(rio_pack_hdr_t));
+    memcpy(base + sizeof(rio_pack_hdr_t), g_entries, sizeof(rio_pack_entry_t) * n);
 
-    /* 填充 g_entries[] —— 直接从 shm 里 memcpy */
-    uint32_t n = hdr->n_entries;
-    rio_pack_clear();
-    if (ensure_cap((int)n) < 0) return -1;
+    RIO_LOG("rio_pack_autoload: 本地 shm mmap %s at %p size=%zu  "
+            "(meta 已填, body 按需拉)",
+            RIO_PACK_SHM_NAME, (void *)base, RIO_PACK_SHM_SIZE);
 
-    const rio_pack_entry_t *e_src = (const rio_pack_entry_t *)(base + sizeof(rio_pack_hdr_t));
-    for (uint32_t i = 0; i < n; i++) {
-        memcpy(&g_entries[i], &e_src[i], sizeof(rio_pack_entry_t));
-        g_count++;
-        RIO_LOG("  [%u] %s  offset=%lu  size=%lu",
-                i, g_entries[i].vpath,
-                (unsigned long)g_entries[i].offset,
-                (unsigned long)g_entries[i].size);
-    }
-    RIO_LOG("rio_pack_autoload: loaded %d entries (SHM mode)", g_count);
     return g_count;
 }
 
 const rio_pack_entry_t *rio_pack_lookup(const char *vpath) {
     if (!vpath) return NULL;
-    if (!g_loaded) {
-        rio_pack_autoload();
-    }
+    if (!g_loaded) { rio_pack_autoload(); }
     for (int i = 0; i < g_count; i++) {
         if (strcmp(g_entries[i].vpath, vpath) == 0)
             return &g_entries[i];
@@ -170,12 +205,109 @@ const rio_pack_entry_t *rio_pack_lookup(const char *vpath) {
     return NULL;
 }
 
-/* shm 模式下这些函数都是 stub —— pack 文件路径已不适用，
- * 因为 pack 内容直接存在服务端初始化的 16MB POSIX 共享内存里 */
-void rio_pack_set_pack_file(const char *pack_file) {
-    (void)pack_file;
-    /* no-op — shm 模式下 pack 路径由 RIO_PACK_SHM_NAME 固定 */
+int rio_pack_find_seg_idx(const char *vpath) {
+    if (!vpath) return -1;
+    if (!g_loaded) { rio_pack_autoload(); }
+    for (int i = 0; i < g_count; i++) {
+        if (strcmp(g_entries[i].vpath, vpath) == 0)
+            return i;
+    }
+    return -1;
 }
+
+/* ---- 按需拉取 ----
+ *
+ * rio_pack_ensure_seg(seg_idx):
+ *   1) OP_SEG_VERSION 快速查询服务端当前 version
+ *   2) 如果本地没加载 或者 version 变了 → OP_SEG_READ 拉完整 body
+ *   3) 把拉到的 body memcpy 到本地 shm 对应位置
+ */
+int rio_pack_ensure_seg(uint32_t seg_idx) {
+    if ((int)seg_idx >= g_count || !g_shm_base) {
+        RIO_LOG("rio_pack_ensure_seg: seg_idx=%u 超出范围", seg_idx);
+        return -1;
+    }
+
+    /* 每次都拉最新 body — 保证"他人"修改服务端 body 后客户端下次 read 自动看到。
+     * 网络开销 = seg_size 字节（64/128/256/...），远小于 16MB 全量同步。*/
+    uint64_t seg_sz = g_entries[seg_idx].size;
+    if (seg_sz == 0 || seg_sz > (uint64_t)RIO_PACK_SHM_SIZE) {
+        RIO_LOG("rio_pack_ensure_seg(%u): seg_size=%lu 异常",
+                seg_idx, (unsigned long)seg_sz);
+        return -1;
+    }
+
+    uint8_t *tmp = (uint8_t *)malloc((size_t)seg_sz);
+    if (!tmp) { RIO_LOG("seg read tmp alloc fail"); return -1; }
+
+    uint32_t got_version = 0;
+    if (rio_do_seg_read(seg_idx, (uint32_t)seg_sz, tmp, (uint32_t)seg_sz,
+                        &got_version) < 0) {
+        RIO_LOG("rio_pack_ensure_seg(%u): OP_SEG_READ 失败", seg_idx);
+        free(tmp);
+        return -1;
+    }
+
+    /* 写入本地 shm 对应位置 */
+    uint64_t local_off = g_entries[seg_idx].offset;
+    memcpy(g_shm_base + local_off, tmp, (size_t)seg_sz);
+    free(tmp);
+
+    g_seg_loaded[seg_idx] = 1;
+    g_seg_versions[seg_idx] = got_version;
+
+    RIO_LOG("rio_pack_ensure_seg(%u): %s loaded  (version=%u)",
+            seg_idx, g_entries[seg_idx].vpath, got_version);
+    return 0;
+}
+
+void rio_pack_mark_dirty(uint32_t seg_idx) {
+    if ((int)seg_idx >= g_count) return;
+    g_seg_dirty[seg_idx] = 1;
+}
+
+/* 把指定 seg 完整穿透到服务端 —— write/pwrite 后立刻调
+ * 返回 0 成功，-1 失败 */
+int rio_pack_push_seg(uint32_t seg_idx) {
+    if ((int)seg_idx >= g_count || !g_shm_base) return -1;
+    uint64_t off = g_entries[seg_idx].offset;
+    uint64_t sz  = g_entries[seg_idx].size;
+    int rc = rio_do_write_seg(seg_idx, g_shm_base + off, (uint32_t)sz);
+    if (rc == 0) {
+        g_seg_dirty[seg_idx] = 0;
+        g_seg_versions[seg_idx]++;
+        RIO_LOG("rio_pack_push_seg(%u) %s → %lu bytes pushed",
+                seg_idx, g_entries[seg_idx].vpath, (unsigned long)sz);
+    } else {
+        RIO_LOG("rio_pack_push_seg(%u) 失败", seg_idx);
+    }
+    return rc;
+}
+
+int rio_pack_flush_dirty_segs(void) {
+    if (!g_seg_dirty || !g_shm_base) return 0;
+    int written = 0;
+    for (int i = 0; i < g_count; i++) {
+        if (!g_seg_dirty[i] || !g_seg_loaded[i]) continue;
+        uint64_t sz = g_entries[i].size;
+        uint64_t off = g_entries[i].offset;
+        if (rio_do_write_seg((uint32_t)i, g_shm_base + off, (uint32_t)sz) == 0) {
+            g_seg_dirty[i] = 0;
+            written++;
+            /* 服务端 version++ —— 我们看不到具体值了，但至少知道自己刚写过 */
+            g_seg_versions[i]++;
+            RIO_LOG("rio_pack_flush_dirty_segs: seg[%d] %s written",
+                    i, g_entries[i].vpath);
+        } else {
+            RIO_LOG("rio_pack_flush_dirty_segs: seg[%d] write failed", i);
+        }
+    }
+    return written;
+}
+
+/* ---- stub 函数 ---- */
+
+void rio_pack_set_pack_file(const char *pack_file) { (void)pack_file; }
 
 const char *rio_pack_pack_file(void) {
     return "/dev/shm" RIO_PACK_SHM_NAME;
@@ -183,11 +315,10 @@ const char *rio_pack_pack_file(void) {
 
 int rio_pack_register(const char *vpath, uint64_t offset, uint64_t size) {
     (void)vpath; (void)offset; (void)size;
-    /* shm 模式下不支持 register —— pack header 是 self-describing */
     return -1;
 }
 
 void rio_pack_init(void) {
-    RIO_LOG("rio_pack: init (shm_name=%s, size=%dMB, autoload on first open)",
+    RIO_LOG("rio_pack: init (shm_name=%s, size=%dMB, 按需拉取+版本化)",
             RIO_PACK_SHM_NAME, RIO_PACK_SHM_SIZE / (1024 * 1024));
 }

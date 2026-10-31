@@ -257,57 +257,75 @@ off_t rio_do_lseek(remote_handle_t rh, off_t offset, int whence) {
     return (off_t)(int64_t)rv;
 }
 
-/* ---------- shm 模式专用（跨机器全量下载） ---------- */
+/* ---------- 按需拉取 + 版本化 新协议 ---------- */
 
 /*
- * 向远程服务端请求全量 pack 数据：
- *   请求体: [4B name_len][shm_name\0]
- *   响应体: [8B shm_size][pack 数据 (shm_size 字节)]
- *
- * 成功时分配 *out_pack_data（调用方 free），填入 *out_pack_size。
- * 服务端会 dump 它整个 g_shm_base —— 客户端收完后本地 shm_open + mmap + memcpy 写进去。
+ * OP_PACK_META: 请求空 body → 服务端返回 header+entries+versions[] 打包在响应 body 里
  */
-int rio_do_shm_open_req(const char *shm_name,
-                        uint8_t **out_pack_data, uint32_t *out_pack_size) {
-    uint32_t plen = (uint32_t)strlen(shm_name) + 1;
-    uint32_t body_len = 4 + plen;
+int rio_do_pack_meta(uint8_t *out_meta_buf, uint32_t out_meta_cap, uint32_t *out_meta_len) {
+    uint64_t rv = 0;
+    uint32_t got = 0;
+    int rc = rio_call(OP_PACK_META, NULL, 0, out_meta_buf, out_meta_cap, &rv, &got);
+    if (rc < 0) return -1;
+    if (out_meta_len) *out_meta_len = got;
+    RIO_LOG("rio_do_pack_meta: got %u bytes", got);
+    return 0;
+}
+
+/*
+ * OP_SEG_VERSION: 只查询某段 version（不拉 body，极轻量）
+ * body: [4B seg_idx]
+ * 响应 body: [8B version]
+ */
+int rio_do_seg_version(uint32_t seg_idx, uint32_t *out_version) {
+    uint32_t body = seg_idx;
+    uint64_t rv = 0;
+    int rc = rio_call(OP_SEG_VERSION, &body, sizeof(body), NULL, 0, &rv, NULL);
+    if (rc < 0) return -1;
+    if (out_version) *out_version = (uint32_t)rv;
+    return 0;
+}
+
+/*
+ * OP_SEG_READ: 拉某段完整 body
+ * body: [4B seg_idx]
+ * 响应: [8B version][seg_size 字节 body]
+ * ret_val 里是 version，额外 body 是 seg 数据
+ */
+int rio_do_seg_read(uint32_t seg_idx, uint32_t seg_size,
+                    uint8_t *out_buf, uint32_t out_cap, uint32_t *out_version) {
+    uint32_t body = seg_idx;
+    uint64_t rv = 0;
+    uint32_t got = 0;
+    int rc = rio_call(OP_SEG_READ, &body, sizeof(body), out_buf, out_cap, &rv, &got);
+    if (rc < 0) return -1;
+    /* got 应该等于 seg_size（响应 body 就是 seg 数据本身）*/
+    if (got != seg_size) {
+        RIO_LOG("rio_do_seg_read(seg=%u): got %u want %u", seg_idx, got, seg_size);
+        return -1;
+    }
+    if (out_version) *out_version = (uint32_t)rv;
+    RIO_LOG("rio_do_seg_read(seg=%u): %u bytes version=%u", seg_idx, got, (uint32_t)rv);
+    return 0;
+}
+
+/*
+ * OP_WRITE_SEG: 穿透写某段到服务端（服务端 version++）
+ * body: [4B seg_idx][4B data_len][data...]
+ */
+int rio_do_write_seg(uint32_t seg_idx, const uint8_t *data, uint32_t data_len) {
+    uint32_t body_len = 4 + 4 + data_len;
     uint8_t *body = (uint8_t *)malloc(body_len);
     if (!body) return -1;
     uint32_t off = 0;
-    memcpy(body + off, &plen, 4); off += 4;
-    memcpy(body + off, shm_name, plen);
-
-    /* 先按固定 RIO_PACK_SHM_SIZE 分配；服务端 ret_val 会告诉我真实 shm_size（校验用）*/
-    uint32_t alloc_sz = RIO_PACK_SHM_SIZE;
-    uint8_t *out_buf = (uint8_t *)malloc(alloc_sz);
-    if (!out_buf) { free(body); return -1; }
+    uint32_t s32 = seg_idx;    memcpy(body + off, &s32, 4); off += 4;
+    uint32_t d32 = data_len;   memcpy(body + off, &d32, 4); off += 4;
+    if (data_len) memcpy(body + off, data, data_len);
 
     uint64_t rv = 0;
-    uint32_t got = 0;
-    int rc = rio_call(OP_SHM_OPEN, body, body_len, out_buf, alloc_sz, &rv, &got);
+    int rc = rio_call(OP_WRITE_SEG, body, body_len, NULL, 0, &rv, NULL);
     free(body);
-
-    if (rc < 0) {
-        free(out_buf);
-        return -1;
-    }
-
-    /* 校验：ret_val 里是服务端 dump 的 shm_size，应该和我们预期一致 */
-    uint32_t srv_size = (uint32_t)rv;
-    if (srv_size != alloc_sz) {
-        RIO_LOG("rio_do_shm_open_req: shm_size mismatch (want %u, srv says %u)",
-                alloc_sz, srv_size);
-        free(out_buf);
-        return -1;
-    }
-    if (got != srv_size) {
-        RIO_LOG("rio_do_shm_open_req: body got %u, want %u", got, srv_size);
-        free(out_buf);
-        return -1;
-    }
-
-    *out_pack_data = out_buf;
-    *out_pack_size = got;
-    RIO_LOG("rio_do_shm_open_req: got %u bytes from server", got);
-    return 0;
+    if (rc < 0) return -1;
+    /* ret_val 应该是 0 成功 */
+    return (int)rv;
 }

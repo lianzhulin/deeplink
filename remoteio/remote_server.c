@@ -40,6 +40,10 @@
 static void *g_shm_base = NULL;
 static size_t g_shm_size = RIO_PACK_SHM_SIZE;
 
+/* 每段 version —— 任何人修改某段 body 后 +1（服务端权威版本）*/
+static uint32_t *g_seg_versions = NULL;
+static uint32_t  g_n_segs_srv  = 0;
+
 /*
  * 在 shm 里写入默认的测试 pack 数据（和 test_pack_client.c / gen_pack.py 预期一致）。
  * 如果 shm 已经有正确的 magic（说明 gen_pack.py 写过），就跳过。
@@ -107,6 +111,11 @@ static void write_default_pack(void *base) {
            (unsigned long)body_off,
            (unsigned long)cur_off,
            (unsigned long)g_shm_size);
+
+    /* 初始化 seg_versions 数组 —— 和 n_entries 一致 */
+    g_n_segs_srv = n_segs;
+    if (g_seg_versions) free(g_seg_versions);
+    g_seg_versions = (uint32_t *)calloc(n_segs, sizeof(uint32_t));
 }
 
 /*
@@ -176,8 +185,18 @@ static int init_shm(const char *shm_name, size_t shm_size, int truncate_existing
     /* 写默认 pack 数据（如果还没写过）*/
     write_default_pack(base);
 
-    printf("[srv] shm %s ready  base=%p  size=%zu\n",
-           shm_name, base, shm_size);
+    /* 兜底：如果 write_default_pack 跳过了（已有有效 magic），
+     * seg_versions 还没初始化 —— 从 header 里读 n_entries 来补 */
+    if (g_seg_versions == NULL) {
+        const rio_pack_hdr_t *hdr_chk = (const rio_pack_hdr_t *)base;
+        uint32_t n = hdr_chk->n_entries;
+        g_seg_versions = (uint32_t *)calloc(n, sizeof(uint32_t));
+        g_n_segs_srv = n;
+        printf("[srv] (兜底) 从已有 shm header 初始化 seg_versions n=%u\n", n);
+    }
+
+    printf("[srv] shm %s ready  base=%p  size=%zu  n_segs=%u\n",
+           shm_name, base, shm_size, g_n_segs_srv);
     return 0;
 }
 
@@ -215,35 +234,80 @@ static int send_resp(int cli, uint32_t opcode, uint64_t ret_val,
     return 0;
 }
 
-/*
- * OP_SHM_OPEN：客户端全量下载 pack 数据（跨机器模式）。
- * body: [4B plen][shm_name_str]
- *
- * 响应: [8B shm_size][pack 数据 (g_shm_size 字节)]
- *   ret_val 填 g_shm_size（客户端校验用）
- *   extra/extra_len 是 g_shm_base/g_shm_size —— 整个 16MB shm 一次性 dump 出去
- */
-static void handle_shm_open(int cli, const uint8_t *body, uint32_t len) {
+/* ---- OP_PACK_META：客户端拉 pack 元数据（3KB 级别）----
+ * 响应 body: [4B n_entries][rio_pack_hdr_t][rio_pack_entry_t*n][4B*n versions]
+ * 只包含 header+entries+版本数组 —— 不含 16MB body */
+static void handle_pack_meta(int cli) {
+    uint32_t n = g_n_segs_srv;
+    const rio_pack_hdr_t *hdr = (const rio_pack_hdr_t *)g_shm_base;
+    const rio_pack_entry_t *entries = (const rio_pack_entry_t *)(g_shm_base + sizeof(rio_pack_hdr_t));
+
+    uint32_t meta_len = 4 + sizeof(rio_pack_hdr_t) +
+                        sizeof(rio_pack_entry_t) * n + sizeof(uint32_t) * n;
+    uint8_t *meta = (uint8_t *)malloc(meta_len);
+    if (!meta) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); return; }
+
+    uint32_t off = 0;
+    memcpy(meta + off, &n, 4);                           off += 4;
+    memcpy(meta + off, hdr, sizeof(rio_pack_hdr_t));     off += sizeof(rio_pack_hdr_t);
+    memcpy(meta + off, entries, sizeof(rio_pack_entry_t) * n); off += sizeof(rio_pack_entry_t) * n;
+    memcpy(meta + off, g_seg_versions, sizeof(uint32_t) * n);
+
+    /* ret_val 填 n 方便客户端校验 */
+    send_resp(cli, OP_ACK, (uint64_t)n, meta, meta_len);
+    printf("[srv] OP_PACK_META → n=%u  meta_len=%u\n", n, meta_len);
+    free(meta);
+}
+
+/* ---- OP_SEG_VERSION: 只查某段 version（不拉 body）---- */
+static void handle_seg_version(int cli, const uint8_t *body, uint32_t len) {
     if (len < 4) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); return; }
-    uint32_t plen; memcpy(&plen, body, 4);
-    if (plen > len - 4) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); return; }
+    uint32_t idx; memcpy(&idx, body, 4);
+    if (idx >= g_n_segs_srv) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); return; }
+    send_resp(cli, OP_ACK, (uint64_t)g_seg_versions[idx], NULL, 0);
+}
 
-    char name[256] = {0};
-    size_t copy = plen < sizeof(name) ? plen - 1 : sizeof(name) - 1;
-    memcpy(name, body + 4, copy);
+/* ---- OP_SEG_READ: 拉某段完整 body ----
+ * ret_val = version，extra body = seg 内容（从 g_shm_base + entry.offset）*/
+static void handle_seg_read(int cli, const uint8_t *body, uint32_t len) {
+    if (len < 4) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); return; }
+    uint32_t idx; memcpy(&idx, body, 4);
+    if (idx >= g_n_segs_srv) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); return; }
 
-    /* 确保 shm 还在（防止被误 unlink） —— 存在性校验 */
-    int fd = shm_open(name, O_RDWR, 0);
-    if (fd >= 0) close(fd);
-    if (!g_shm_base) {
-        fprintf(stderr, "[srv] handle_shm_open: g_shm_base is NULL\n");
-        send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0);
-        return;
-    }
+    const rio_pack_entry_t *entry = (const rio_pack_entry_t *)(g_shm_base + sizeof(rio_pack_hdr_t)) + idx;
+    uint64_t off = entry->offset;
+    uint32_t sz  = (uint32_t)entry->size;
 
-    RIO_LOG("[srv] dump %s → 客户端 (size=%zu bytes)...", name, g_shm_size);
-    send_resp(cli, OP_ACK, (uint64_t)g_shm_size, g_shm_base, (uint32_t)g_shm_size);
-    printf("[srv] OP_SHM_OPEN %s -> ACK (%zu bytes dumped)\n", name, g_shm_size);
+    send_resp(cli, OP_ACK, (uint64_t)g_seg_versions[idx],
+              g_shm_base + off, sz);
+    printf("[srv] OP_SEG_READ seg[%u] %s → %u bytes version=%u\n",
+           idx, entry->vpath, sz, g_seg_versions[idx]);
+}
+
+/* ---- OP_WRITE_SEG: 客户端穿透写某段 ----
+ * body: [4B seg_idx][4B data_len][data...]
+ * 服务端: memcpy(g_shm_base + entry.offset, data, data_len) + version++ */
+static void handle_write_seg(int cli, const uint8_t *body, uint32_t len) {
+    if (len < 8) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); return; }
+    uint32_t idx, dlen;
+    uint32_t off = 0;
+    memcpy(&idx, body + off, 4); off += 4;
+    memcpy(&dlen, body + off, 4); off += 4;
+    if (idx >= g_n_segs_srv) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); return; }
+    if (off + dlen > len) { send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0); return; }
+
+    const rio_pack_entry_t *entry = (const rio_pack_entry_t *)(g_shm_base + sizeof(rio_pack_hdr_t)) + idx;
+    uint64_t seg_off = entry->offset;
+    uint32_t seg_sz  = (uint32_t)entry->size;
+
+    /* 安全：最多写 seg_sz 字节 */
+    uint32_t n = dlen < seg_sz ? dlen : seg_sz;
+    memcpy(g_shm_base + seg_off, body + off, n);
+    g_seg_versions[idx]++;  /* 修改后 version++ —— 客户端下次 OP_SEG_VERSION 就能发现 */
+
+    send_resp(cli, OP_ACK, 0, NULL, 0);
+    printf("[srv] OP_WRITE_SEG seg[%u] %s ← %u bytes  version→%u\n",
+           idx, entry->vpath, n, g_seg_versions[idx]);
 }
 
 static void serve_client(int cli) {
@@ -261,10 +325,12 @@ static void serve_client(int cli) {
             if (recv_all(cli, body, hdr.body_len) < 0) { free(body); break; }
         }
         switch (hdr.opcode) {
-            case OP_SHM_OPEN: handle_shm_open(cli, body, hdr.body_len); break;
+            case OP_PACK_META:   handle_pack_meta(cli); break;
+            case OP_SEG_VERSION: handle_seg_version(cli, body, hdr.body_len); break;
+            case OP_SEG_READ:    handle_seg_read(cli, body, hdr.body_len); break;
+            case OP_WRITE_SEG:   handle_write_seg(cli, body, hdr.body_len); break;
             default:
-                /* shm 模式下不处理旧协议 —— 直接 ACK 但返回 -1 */
-                fprintf(stderr, "[srv] unknown opcode %u (shm mode)\n", hdr.opcode);
+                fprintf(stderr, "[srv] unknown opcode %u\n", hdr.opcode);
                 send_resp(cli, OP_ERR, (uint64_t)-1, NULL, 0);
                 break;
         }
@@ -297,8 +363,8 @@ int main(int argc, char **argv) {
 
     /* --- 初始化 shm --- */
     printf("[srv] 初始化 %s (%zu MB) 共享内存段...\n",
-           RIO_PACK_SHM_NAME, (size_t)RIO_PACK_SHM_SIZE / (1024 * 1024));
-    if (init_shm(RIO_PACK_SHM_NAME, RIO_PACK_SHM_SIZE, truncate_existing) < 0) {
+           RIO_PACK_SHM_NAME_SRV, (size_t)RIO_PACK_SHM_SIZE / (1024 * 1024));
+    if (init_shm(RIO_PACK_SHM_NAME_SRV, RIO_PACK_SHM_SIZE, truncate_existing) < 0) {
         fprintf(stderr, "[srv] shm 初始化失败，退出\n");
         return 1;
     }
@@ -319,7 +385,7 @@ int main(int argc, char **argv) {
     }
     if (listen(ls, 16) < 0) { perror("listen"); return 1; }
     printf("[srv] listening on 0.0.0.0:%d  (shm mode, pack in %s)\n",
-           port, RIO_PACK_SHM_NAME);
+           port, RIO_PACK_SHM_NAME_SRV);
     fflush(stdout);
 
     while (1) {

@@ -16,7 +16,8 @@ static rio_slot_t  g_slots[RIO_MAX_REMOTE_FDS];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int rio_map_alloc(uint8_t *shm_base, size_t shm_size,
-                  uint64_t virtual_offset, uint64_t virtual_size) {
+                  uint64_t virtual_offset, uint64_t virtual_size,
+                  uint32_t seg_idx) {
     pthread_mutex_lock(&g_lock);
     int idx = -1;
     for (int i = 0; i < RIO_MAX_REMOTE_FDS; i++) {
@@ -27,6 +28,7 @@ int rio_map_alloc(uint8_t *shm_base, size_t shm_size,
             g_slots[i].virtual_off = virtual_offset;
             g_slots[i].virtual_sz  = virtual_size;
             g_slots[i].local_pos   = 0;
+            g_slots[i].seg_idx     = seg_idx;
             idx = i;
             break;
         }
@@ -69,5 +71,6 @@ void rio_map_free(int fd) {
     g_slots[idx].virtual_off = 0;
     g_slots[idx].virtual_sz  = 0;
     g_slots[idx].local_pos   = 0;
+    g_slots[idx].seg_idx     = 0;
     pthread_mutex_unlock(&g_lock);
 }

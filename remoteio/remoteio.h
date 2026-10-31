@@ -1,36 +1,24 @@
 /*
  * remoteio.h — LD_PRELOAD 远程文件 I/O 劫持库 公共接口
  *
- * 当前版本仅支持 pack 模式（跨机器全量同步 + 本地 memcpy）：
- *   服务端启动时创建 16MB POSIX 共享内存 (RIO_PACK_SHM_NAME)，
- *   写入自描述 pack 格式头部 (rio_pack_hdr_t + entries + body)。
- *   客户端首次 open() 虚拟路径时：
- *     → OP_SHM_OPEN 请求服务端 dump 整个 16MB shm 到 TCP 响应
- *     → 客户端本地创建同名 POSIX shm + mmap + memcpy 写入
- *     → 之后所有虚拟文件 I/O 都是本地 memcpy —— 零网络、零磁盘。
- *   业务代码零配置，直接 open("/virtual/config.txt") 即可。
+ * 当前版本：**按需拉取 + 版本检测 + 写穿透**（跨机器 + 服务端数据实时可变）
+ *
+ * 核心流程：
+ *   1) 客户端启动发 OP_PACK_META → 服务端返回 header + entries + seg_versions[]
+ *      网络开销 ~3KB（16MB shm 的 99.98% 空间在 body，这里完全不拉）
+ *   2) 客户端本地创建 16MB POSIX shm + mmap → 只把 header+entries 填进去
+ *   3) 每段 body 按需拉：第一次 read 某段 → OP_SEG_READ(seg_idx) → 客户端本地 memcpy
+ *   4) 每次 read 前先 OP_SEG_VERSION 检查服务端该段 version，变了就重拉
+ *   5) write: 本地 shm 写 + dirty=1 → close/flush 时 OP_WRITE_SEG 穿透到服务端
+ *   6) 之后所有虚拟文件 I/O 仍然是本地 memcpy —— 版本检测+按需拉只在必要时走 TCP
+ *
+ * 服务端侧：
+ *   维护 g_shm_base (16MB) + seg_versions[n_segs]
+ *   任何人修改某段 body 后 version++
+ *   客户端发 OP_SEG_VERSION 就能发现
  *
  * 协议格式（二进制，网络字节序）：
  *   [4B magic][4B opcode][4B body_len][body...]
- *
- * 请求操作码：
- *   OP_OPEN    = 1   body: [4B path_len][path...][4B flags][4B mode]
- *   OP_OPENAT  = 2   body: [4B dirfd][4B path_len][path...][4B flags][4B mode]
- *   OP_READ    = 3   body: [4B handle][4B count]
- *   OP_WRITE   = 4   body: [4B handle][4B count][data...]
- *   OP_CLOSE   = 5   body: [4B handle]
- *   OP_LSEEK   = 6   body: [4B handle][8B offset][4B whence]
- *   OP_SHM_OPEN = 10 body: [4B name_len][shm_name\0]  ← dump 整个 shm
- *
- * 响应格式：
- *   OP_ACK / OP_ERR  通用: [8B ret_val]  可选追加 body
- *   OP_SHM_OPEN 特例: [8B shm_size][shm_size 字节 pack 数据]
- *
- * 关键架构约束：
- *   - POSIX 共享内存是单机内核对象，跨机器**无法共享**
- *   - 所以"同机模式下客户端直接 shm_open + mmap 同一段"不可行
- *   - 改为：一次 TCP 全量同步 16MB → 客户端本地 shm + memcpy
- *   - 之后零网络零磁盘，与同机模式的 I/O 层行为完全一致
  */
 
 #ifndef REMOTEIO_H
@@ -45,13 +33,22 @@
 #define RIO_MAGIC   0x52494F31u   /* "RIO1" */
 
 enum {
-    OP_OPEN   = 1,
-    OP_OPENAT = 2,
-    OP_READ   = 3,
-    OP_WRITE  = 4,
-    OP_CLOSE  = 5,
-    OP_LSEEK  = 6,
-    OP_SHM_OPEN = 10,            /* 新增：客户端请求服务端初始化 shm 段 */
+    OP_OPEN    = 1,
+    OP_OPENAT  = 2,
+    OP_READ    = 3,
+    OP_WRITE   = 4,
+    OP_CLOSE   = 5,
+    OP_LSEEK   = 6,
+
+    /* ====== 按需拉取 + 版本化 专用 ====== */
+    OP_PACK_META  = 10,   /* 客户端拉 meta: 请求空; 响应 body = [4B n_entries][pack_hdr+entries][4B*n_versions] */
+    OP_SEG_READ   = 11,   /* body: [4B seg_idx] → 响应: [8B version][seg_size 字节 body] */
+    OP_SEG_VERSION= 12,   /* body: [4B seg_idx] → 响应: [8B version] (快速查询, 不拉 body) */
+    OP_WRITE_SEG  = 13,   /* body: [4B seg_idx][4B data_len][data...] → 服务端写回 + version++ */
+
+    /* 旧 OP_SHM_OPEN 保留做同机兼容（本方案不使用） */
+    OP_SHM_OPEN = 10,      /* ← 注意: OP_PACK_META 取代了它的位置，这里仅保留文档 */
+
     /* 服务端响应 */
     OP_ACK    = 0x80,
     OP_ERR    = 0x81,
@@ -69,9 +66,22 @@ enum {
 #endif
 
 /* ---------- 共享内存 pack 配置 ---------- */
-#ifndef RIO_PACK_SHM_NAME
-#define RIO_PACK_SHM_NAME  "/rio_packshm"   /* POSIX shm_open 名称 */
+
+/* 服务端 shm 名称 — 客户端只通过 OP_PACK_META 读它的 header/entries，
+ * 通过 OP_SEG_READ 读它的 seg body（不拉整个 shm）。
+ * 注意：客户端**绝不直接 shm_open 这个名称**（会 O_TRUNC 破坏服务端 shm）！*/
+#ifndef RIO_PACK_SHM_NAME_SRV
+#define RIO_PACK_SHM_NAME_SRV  "/rio_packshm_srv"
 #endif
+
+/* 客户端本地 shm 名称 — 客户端自己 O_CREAT|O_TRUNC 这个，
+ * 和服务端完全独立（同机也不会互相影响）。
+ * 客户端只把 OP_PACK_META 拉到的 header+entries 写进去，
+ * body 区域按需通过 OP_SEG_READ 拉取后填充。*/
+#ifndef RIO_PACK_SHM_NAME
+#define RIO_PACK_SHM_NAME  "/rio_packshm_client"
+#endif
+
 #ifndef RIO_PACK_SHM_SIZE
 #define RIO_PACK_SHM_SIZE  (16 * 1024 * 1024)   /* 16 MB 固定大小 */
 #endif
@@ -116,16 +126,39 @@ typedef struct {
     uint64_t         virtual_off;   /* pack 段起始偏移 */
     uint64_t         virtual_sz;    /* 虚拟文件最大长度 */
     uint64_t         local_pos;     /* 该 fd 当前位置 */
+    uint32_t         seg_idx;       /* 对应 pack entry 下标（按需拉取 + 版本化用）*/
 } rio_slot_t;
 
 /* ---------- 连接管理 ---------- */
 int  rio_connect(void);
 void rio_disconnect(void);
 
-/* OP_SHM_OPEN: 从远程服务端全量下载 pack 数据（服务端 dump 它的 16MB shm）
- * 成功时 *out_pack_data 是 malloc 的 buffer（调用方 free），*out_pack_size 是长度 */
-int  rio_do_shm_open_req(const char *shm_name,
-                         uint8_t **out_pack_data, uint32_t *out_pack_size);
+/* ---------- 按需拉取 + 版本化 新协议 ---------- */
+
+/*
+ * OP_PACK_META: 拉 pack 元数据（header + entries + 每段 version 数组）
+ * 响应格式:
+ *   [4B n_entries][sizeof(rio_pack_hdr_t) 字节 hdr][sizeof(rio_pack_entry_t)*n_entries 字节 entries]
+ *   [4B*n_entries 字节 seg_versions[]]
+ * 调用方传入 out_meta_cap，成功返回实际 body_len（≤ out_meta_cap）。
+ */
+int rio_do_pack_meta(uint8_t *out_meta_buf, uint32_t out_meta_cap, uint32_t *out_meta_len);
+
+/* OP_SEG_VERSION: 快速查询服务端某段当前 version（不拉 body） */
+int rio_do_seg_version(uint32_t seg_idx, uint32_t *out_version);
+
+/* OP_SEG_READ: 拉某段 body 内容
+ * 响应: [8B version][seg_size 字节 body]
+ * 调用方必须确保 out_buf 容量 ≥ seg_size（从 pack_entry_t.size 知道）。
+ */
+int rio_do_seg_read(uint32_t seg_idx, uint32_t seg_size,
+                    uint8_t *out_buf, uint32_t out_cap, uint32_t *out_version);
+
+/* OP_WRITE_SEG: 把某段 body 穿透写回服务端
+ * 请求: [4B seg_idx][4B data_len][data...]
+ * 服务端: memcpy(g_shm_base + entry.offset, data, data_len) + version++
+ */
+int rio_do_write_seg(uint32_t seg_idx, const uint8_t *data, uint32_t data_len);
 
 /* （保留的通用协议函数，shm 模式下不使用） */
 int  rio_do_open(const char *path, int flags, mode_t mode, remote_handle_t *out);
@@ -139,7 +172,8 @@ off_t  rio_do_lseek(remote_handle_t rh, off_t offset, int whence);
 
 /* 分配 pack 模式假 fd */
 int  rio_map_alloc(uint8_t *shm_base, size_t shm_size,
-                   uint64_t virtual_offset, uint64_t virtual_size);
+                   uint64_t virtual_offset, uint64_t virtual_size,
+                   uint32_t seg_idx);
 
 int  rio_map_is_remote(int fd);
 const rio_slot_t *rio_map_slot(int fd);
