@@ -248,10 +248,4 @@ off_t rio_do_lseek(remote_handle_t rh, off_t offset, int whence) {
     return (off_t)(int64_t)rv;
 }
 
-/* ---------- 路径判断 ---------- */
-int rio_is_remote_path(const char *path) {
-    if (!path) return 0;
-    static const char prefix[] = RIO_REMOTE_PREFIX;
-    size_t pl = sizeof(prefix) - 1;
-    return strncmp(path, prefix, pl) == 0;
-}
+/* 注意：路径判断已移到 rio_pack 模块 —— libremoteio.c 统一用 rio_pack_lookup() */

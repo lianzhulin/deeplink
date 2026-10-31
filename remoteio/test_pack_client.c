@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "rio_pack.h"
 
 static int tp = 0, tf = 0;
 #define CHECK(cond, msg) do { \
@@ -247,7 +248,17 @@ static void test_independent_pos(void) {
 }
 
 int main(void) {
-    printf("RIO_PACK_CONFIG=%s\n", getenv("RIO_PACK_CONFIG") ? getenv("RIO_PACK_CONFIG") : "(未设置)");
+    /* ---- 关键：运行时注入 pack 映射（libremoteio.so 本身不含这些信息）----
+     * 业务代码在任何 open() 前调用即可。
+     * gen_pack.py 生成的 pack.bin 段信息：
+     *   seg1 config.txt  offset=0,   size=64
+     *   seg2 header.bin  offset=64,  size=128
+     *   seg3 records.log offset=192, size=256
+     */
+    rio_pack_set_pack_file("/remote/pack.bin");
+    rio_pack_register("/virtual/config.txt",   0,    64);
+    rio_pack_register("/virtual/header.bin",   64,   128);
+    rio_pack_register("/virtual/records.log",  192,  256);
 
     test_read_three_files();
     test_lseek_independent();
