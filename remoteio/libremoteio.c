@@ -153,8 +153,8 @@ static void rio_init(void) {
 
     RIO_LOG("libremoteio initialized (prefix=\"%s\")", RIO_REMOTE_PREFIX);
 
-    /* 自动加载 pack 配置（如果有的话） */
-    rio_pack_autoload();
+    /* pack 模式启用（编译期决定） */
+    rio_pack_init();
 }
 
 /* 兜底：第一次调用时确保所有 real_* 都已 resolve
